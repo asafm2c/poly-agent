@@ -27,18 +27,20 @@ The system SHALL fetch and summarize recent comments on Polymarket markets to ca
 
 #### Scenario: Comments available
 - **WHEN** a market has recent comments on Polymarket
-- **THEN** the system fetches comments via the Gamma API and includes a sentiment summary in the dossier
+- **THEN** the system fetches comments via the Gamma API `/comments` endpoint using `parent_entity_id=<market_id>` and `parent_entity_type=market` query parameters, and includes a sentiment summary in the dossier
 
-#### Scenario: No comments available
-- **WHEN** a market has no comments
-- **THEN** the dossier notes the absence of community discussion (not treated as an error)
+#### Scenario: Comments unavailable
+- **WHEN** a market has no comments or the comments endpoint returns an error (e.g. 422)
+- **THEN** the dossier notes the absence of community discussion (logged at debug level, not treated as an error)
+
+**Note:** The Gamma `/comments` endpoint may return 422 for some markets or require authentication. The system degrades gracefully — comment data is supplementary, not required for analysis.
 
 ### Requirement: Related market context
 The system SHALL identify related Polymarket markets and include their current prices in the dossier to provide correlation context.
 
 #### Scenario: Related markets found
 - **WHEN** an event has multiple associated markets (e.g., "Will X win?" alongside "Will Y win?")
-- **THEN** the dossier includes related market titles and current prices
+- **THEN** the dossier includes related market titles and current YES prices, extracted from the Gamma API `outcomePrices`/`outcomes` parallel arrays (same field format as DD-11, with JSON string parsing and non-Yes/No fallback)
 
 ### Requirement: Domain-specific research sources
 The system SHALL support pluggable domain-specific research sources per market category (e.g., polling data for politics, on-chain data for crypto).

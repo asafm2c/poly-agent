@@ -1,15 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Discover active markets
-The system SHALL fetch all active markets from the Polymarket Gamma API and store them locally with metadata (title, description, category, resolution criteria, end date, volume, liquidity).
+The system SHALL fetch active markets from the Polymarket Gamma API using server-side filtering (`volume_num_min`, `liquidity_num_min` query params) and store them locally with metadata (question, description, category, resolution criteria, end date, volume, liquidity, outcome prices, CLOB token IDs). Markets are fetched in paginated batches of 500 (`BATCH_SIZE`), with a safety cap of 20 pages (`MAX_PAGES`) to prevent runaway pagination. Default filters use the configured minimum volume and liquidity to avoid fetching 29K+ low-activity markets.
 
 #### Scenario: Initial market discovery
 - **WHEN** the scanner runs a discovery cycle
-- **THEN** all active Polymarket markets are fetched from the Gamma API and stored in the local database with their metadata
+- **THEN** active markets meeting the volume/liquidity floor are fetched from the Gamma API in batches and bulk-upserted into the local database in a single transaction
 
 #### Scenario: Incremental updates
 - **WHEN** the scanner runs after an initial discovery
-- **THEN** only new or changed markets are updated in the database (not a full refetch of unchanged data)
+- **THEN** all markets matching the filter are re-fetched and upserted (ON CONFLICT UPDATE), keeping prices and metadata current
 
 ### Requirement: Filter markets by tradeability criteria
 The system SHALL filter markets based on configurable criteria: minimum volume, minimum liquidity, price range (exclude near-certain >0.90 or near-impossible <0.10), time to resolution (min and max days), and market status (active, not resolved).

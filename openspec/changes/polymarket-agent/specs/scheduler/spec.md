@@ -23,7 +23,7 @@ The system SHALL re-evaluate open positions at a configurable interval (default 
 
 #### Scenario: Position re-evaluation
 - **WHEN** the re-evaluation interval elapses
-- **THEN** each open position is re-analyzed with current market data and research, and exit recommendations are generated if edge has reversed or risk limits are breached
+- **THEN** each open position's current state is logged (side, market, shares, entry price). **Note:** Full re-analysis with exit signal generation is not yet implemented — the current implementation logs position status only. Full re-evaluation would require re-running the estimation pipeline on each position's market.
 
 ### Requirement: Daily portfolio report
 The system SHALL generate a daily portfolio report at a configurable time (default 18:00 UTC) summarizing the day's activity, P&L, and calibration metrics.
@@ -44,8 +44,12 @@ The system SHALL handle shutdown signals (SIGTERM, SIGINT) gracefully, completin
 - **THEN** the current cycle completes but no new orders are placed, and the scheduler stops after the cycle finishes
 
 ### Requirement: Missed cycle handling
-The system SHALL detect and handle missed cycles (e.g., due to system sleep or long-running analysis) by running the missed cycle immediately rather than waiting for the next scheduled time.
+The system SHALL handle missed cycles using APScheduler's `coalesce=True` (collapse multiple missed firings into one) and `misfire_grace_time` (window after which a missed job is skipped). The scan job runs immediately on startup via `next_run_time=datetime.utcnow()`. Analysis and re-evaluation jobs do not run immediately on startup — they wait for their first scheduled interval.
 
 #### Scenario: Missed scan cycle
-- **WHEN** the scheduler detects that a scan cycle was missed
-- **THEN** the scan runs immediately and the schedule resumes from the current time
+- **WHEN** the scheduler starts or a scan cycle was missed within the grace period (60s)
+- **THEN** the scan runs immediately (coalesced if multiple were missed) and the schedule resumes from the current time
+
+#### Scenario: Missed analysis/re-evaluation cycle
+- **WHEN** an analysis or re-evaluation cycle was missed beyond the grace period (120s)
+- **THEN** the missed cycle is skipped and the schedule resumes at the next regular interval

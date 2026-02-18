@@ -18,19 +18,21 @@ The system SHALL update prediction records with actual outcomes when markets res
 The system SHALL compute calibration metrics by bucketing predictions into probability ranges (e.g., 0.0-0.1, 0.1-0.2, ..., 0.9-1.0) and comparing predicted probabilities to actual outcome rates within each bucket.
 
 #### Scenario: Sufficient data for calibration curve
-- **WHEN** at least 20 predictions have resolved
+- **WHEN** at least 2 predictions have resolved
 - **THEN** the system produces a calibration table showing: probability bucket, number of predictions, average predicted probability, actual outcome rate, and calibration error per bucket
 
 #### Scenario: Insufficient data
-- **WHEN** fewer than 20 predictions have resolved
+- **WHEN** fewer than 2 predictions have resolved
 - **THEN** the system reports that calibration data is insufficient and provides raw prediction counts only
+
+**Note:** The general `compute_calibration()` function produces reports with as few as 2 resolved predictions. The LLM-facing `export_calibration_for_llm()` enforces a higher threshold (default 20) before including calibration data in Pass 3 prompts, since small samples would mislead the estimator.
 
 ### Requirement: Category-level calibration
 The system SHALL compute calibration statistics per market category (politics, crypto, sports, etc.) separately, since accuracy may vary by domain.
 
 #### Scenario: Category calibration available
-- **WHEN** a category has at least 10 resolved predictions
-- **THEN** category-specific calibration statistics are available and included in the calibration report
+- **WHEN** a category has any resolved predictions
+- **THEN** category-specific calibration statistics are available and included in the calibration report (no minimum threshold enforced per category; the LLM export threshold applies separately)
 
 ### Requirement: Brier score tracking
 The system SHALL compute the Brier score (mean squared error of probability estimates vs binary outcomes) as an overall accuracy metric, both aggregate and per-category.

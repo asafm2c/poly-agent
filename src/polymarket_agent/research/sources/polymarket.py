@@ -1,5 +1,6 @@
 """Polymarket-specific research: comments and related markets."""
 
+import json as _json
 import logging
 
 from polymarket_agent.market.gamma_client import GammaClient
@@ -62,17 +63,46 @@ class PolymarketResearch:
                 for market in event.get("markets", []):
                     mid = str(market.get("id", ""))
                     if mid != current_market_id:
-                        # Extract YES price
-                        price = None
-                        for token in market.get("tokens", []):
-                            if token.get("outcome", "").upper() == "YES":
-                                price = token.get("price")
+                        price_yes = _extract_yes_price(market)
                         related.append(
                             {
                                 "id": mid,
                                 "question": market.get("question", ""),
-                                "price_yes": float(price) if price else None,
+                                "price_yes": price_yes,
                             }
                         )
                 return related
         return []
+
+
+def _extract_yes_price(market: dict) -> float | None:
+    """Extract YES price from a Gamma API market object (event-embedded format)."""
+    outcomes = market.get("outcomes") or []
+    outcome_prices = market.get("outcomePrices") or []
+
+    if isinstance(outcomes, str):
+        try:
+            outcomes = _json.loads(outcomes)
+        except (ValueError, TypeError):
+            outcomes = []
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = _json.loads(outcome_prices)
+        except (ValueError, TypeError):
+            outcome_prices = []
+
+    for i, name in enumerate(outcomes):
+        if str(name).upper() == "YES" and i < len(outcome_prices):
+            try:
+                return float(outcome_prices[i])
+            except (ValueError, TypeError):
+                pass
+
+    # Fallback: first price for non-Yes/No markets
+    if outcome_prices and not any(str(o).upper() in ("YES", "NO") for o in outcomes):
+        try:
+            return float(outcome_prices[0])
+        except (ValueError, TypeError):
+            pass
+
+    return None

@@ -89,7 +89,7 @@
 - [x] 11.1 Implement APScheduler setup: configure scan interval, analysis interval, re-evaluation interval, daily report time
 - [x] 11.2 Implement scan job: periodic market scanning and candidate flagging
 - [x] 11.3 Implement analysis job: periodic deep analysis of flagged candidates, generate trade recommendations
-- [x] 11.4 Implement re-evaluation job: periodic review of open positions for edge changes or exit signals
+- [x] 11.4 Implement re-evaluation job: periodic logging of open position status (stub — full re-analysis with exit signals not yet implemented)
 - [x] 11.5 Implement daily report job: generate and log daily portfolio report
 - [x] 11.6 Implement graceful shutdown: handle SIGTERM/SIGINT, complete in-progress cycle, stop cleanly
 - [x] 11.7 Implement missed cycle detection: run immediately if a scheduled cycle was missed
@@ -108,4 +108,7 @@
 - [x] 13.3 Add server-side volume/liquidity filtering to `fetch_all_active_markets()`: batch size 500, `volume_num_min`/`liquidity_num_min` params, MAX_PAGES=20 cap
 - [x] 13.4 Add stale/extreme price warnings to CLI `analyze` command
 - [x] 13.5 Fix `volumeNum` field parsing: prefer numeric `volumeNum` over string `volume`
-- [x] 13.6 Fix database locked error during bulk market upsert: use single connection for batch operations
+- [x] 13.6 Fix database locked error during bulk market upsert: single-connection batch transactions + WAL mode + busy_timeout=30s
+- [x] 13.7 Fix `find_related_markets()` to use `outcomePrices`/`outcomes` instead of old `tokens[].price` pattern
+- [x] 13.8 Add non-binary market fallback: index 0=YES, 1=NO when outcomes aren't "YES"/"NO" (e.g. team names)
+- [x] 13.9 Update all OpenSpec artifacts to match implementation (specs, design decisions, task accuracy)

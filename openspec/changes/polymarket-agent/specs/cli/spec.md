@@ -5,7 +5,7 @@ The system SHALL provide a `scan` CLI command that runs the market scanner and d
 
 #### Scenario: Scan with default filters
 - **WHEN** the operator runs `polymarket scan`
-- **THEN** the system scans all markets, applies default filters, and displays a table of candidate markets with columns: title, category, price, volume, days to resolution
+- **THEN** the system scans active markets (with server-side volume/liquidity filtering), applies local filters, and displays a table of candidate markets with columns: ID, Question, Category, YES Price, Volume, Days Left
 
 #### Scenario: Scan with custom filters
 - **WHEN** the operator runs `polymarket scan --category politics --min-volume 10000`
@@ -16,7 +16,15 @@ The system SHALL provide an `analyze` CLI command that runs the full research + 
 
 #### Scenario: Analyze a specific market
 - **WHEN** the operator runs `polymarket analyze <market-id>`
-- **THEN** the system gathers research, runs three-pass estimation, computes edge, and displays: market title, current price, agent estimate, edge, recommendation, and reasoning summary
+- **THEN** the system gathers research, runs three-pass estimation, computes edge, and displays: market question, current price, agent estimate, confidence band, thesis, edge, recommendation, reasoning summary, and LLM cost
+
+#### Scenario: Stale or extreme price warning
+- **WHEN** the market's YES price is <= $0.03 or >= $0.97
+- **THEN** the system displays a warning that the market may be resolved or stale and edge calculations may be unreliable
+
+#### Scenario: Dead market confirmation
+- **WHEN** the market's YES price is exactly $0.00
+- **THEN** the system displays a red warning and requires confirmation before proceeding with analysis
 
 ### Requirement: Portfolio status command
 The system SHALL provide a `portfolio` CLI command that displays current positions, P&L, and portfolio summary.

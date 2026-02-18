@@ -41,16 +41,22 @@ The project runs self-hosted on a Proxmox LXC container (Debian 13). No cloud in
 **Rationale:** Python has the best ecosystem for this: py-clob-client (official SDK), anthropic SDK, data analysis libraries. uv is fast, modern, and handles lockfiles well.
 
 ### D2: SQLite for storage
-**Choice:** SQLite via sqlite3 stdlib module
+**Choice:** SQLite via sqlite3 stdlib module, configured with WAL journal mode, 30-second busy timeout, and foreign key enforcement.
 **Alternatives:** PostgreSQL/TimescaleDB (overkill for single-user), flat files/JSON (fragile for relational data)
 **Rationale:** Single-user, single-process, low write volume. SQLite is zero-config, embedded, and handles the data volumes here easily. Can migrate to PostgreSQL later if needed.
+**Runtime configuration:**
+- `PRAGMA journal_mode=WAL` — enables concurrent reads during writes (critical for bulk market upserts)
+- `PRAGMA busy_timeout=30000` — 30-second wait on lock contention instead of immediate failure
+- `PRAGMA foreign_keys=ON` — enforces referential integrity (e.g., trades → markets)
+- Connection-level `timeout=30.0` — Python sqlite3 connection timeout
+- Bulk upserts use a single connection/transaction for all rows (not one connection per row)
 
 ### D3: Tiered LLM analysis to control costs
 **Choice:** Two-tier approach:
-- **Tier 1 (screening):** Claude Haiku — quick market assessment, ~$0.01/market
-- **Tier 2 (deep analysis):** Claude Sonnet — full probability estimation with reasoning, ~$0.10-0.30/market
+- **Tier 1 (screening):** `claude-haiku-4-5-20251001` — quick market assessment ($0.80/M input, $4.00/M output, ~$0.005/market)
+- **Tier 2 (deep analysis):** `claude-sonnet-4-6` — full 3-pass probability estimation ($3.00/M input, $15.00/M output, ~$0.02-0.03/market observed)
 **Alternatives:** Single model for everything (expensive), local models for screening (lower quality), OpenAI mix (less consistent reasoning)
-**Rationale:** Most markets aren't worth deep analysis. Haiku screens cheaply; Sonnet does the heavy lifting only on candidates. Keeps monthly costs in the $200-400 range.
+**Rationale:** Most markets aren't worth deep analysis. Haiku screens cheaply; Sonnet does the heavy lifting only on candidates. Observed cost: ~$0.025 per full analysis (3 API calls). LLM cost tracking is per-instance (in-memory), not persisted to the database — resets on each CLI invocation.
 
 ### D4: Three-pass probability estimation
 **Choice:** Structured estimation pipeline:
@@ -94,8 +100,10 @@ The project runs self-hosted on a Proxmox LXC container (Debian 13). No cloud in
 - The Gamma API returns market outcomes as parallel arrays: `outcomes` (["Yes","No"]), `outcomePrices` (["0.55","0.45"] as JSON string), and `clobTokenIds` (["token0","token1"] as JSON string)
 - Volume is available as numeric `volumeNum` (preferred) and string `volume`
 - Server-side filtering uses `volume_num_min` and `liquidity_num_min` query params
-- Comments endpoint uses `parent_entity_id` + `parent_entity_type=market`, NOT `asset_id`
+- Comments endpoint uses `parent_entity_id` + `parent_entity_type=market`, NOT `asset_id` (endpoint may return 422 for some markets — handled gracefully)
 - These fields may be JSON-encoded strings and need conditional parsing
+- **Non-binary market fallback:** When outcomes are not "YES"/"NO" (e.g., team names, candidate names), the parser uses index 0 as YES-equivalent and index 1 as NO-equivalent for price extraction
+- The same field format applies to markets embedded in `/events` responses (used by `find_related_markets()`)
 
 ## Risks / Trade-offs
 

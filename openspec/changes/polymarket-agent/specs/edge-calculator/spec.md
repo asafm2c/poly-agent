@@ -43,3 +43,10 @@ The system SHALL only recommend trades when the adjusted edge exceeds a configur
 #### Scenario: Edge below threshold
 - **WHEN** adjusted edge is 0.07 and threshold is 0.10
 - **THEN** the trade is rejected by the edge filter
+
+### Requirement: Minimum trade size
+The system SHALL enforce a minimum trade size of $1.00. If the Kelly-computed size falls below this floor, no trade recommendation is produced (the edge is too small to be worth executing).
+
+#### Scenario: Size below minimum
+- **WHEN** the Kelly-computed trade size is less than $1.00
+- **THEN** no trade recommendation is produced
