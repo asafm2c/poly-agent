@@ -13,7 +13,23 @@ from polymarket_agent.models import (
 logger = logging.getLogger(__name__)
 
 
-def compute_edge(estimate: ProbabilityEstimate, market: Market) -> tuple[float, float, Side]:
+def compute_taker_fee(price: float, fee_rate: float, exponent: float = 1.0) -> float:
+    """Compute Polymarket taker fee per share.
+
+    Formula: price * fee_rate * (price * (1 - price))^exponent
+    Returns 0.0 if fee_rate is 0 or price is at extremes.
+    """
+    if fee_rate <= 0 or price <= 0 or price >= 1:
+        return 0.0
+    return price * fee_rate * (price * (1.0 - price)) ** exponent
+
+
+def compute_edge(
+    estimate: ProbabilityEstimate,
+    market: Market,
+    fee_rate: float = 0.0,
+    fee_exponent: float = 1.0,
+) -> tuple[float, float, Side]:
     """Compute raw and adjusted edge.
 
     Returns (raw_edge, adjusted_edge, side).
@@ -32,6 +48,12 @@ def compute_edge(estimate: ProbabilityEstimate, market: Market) -> tuple[float, 
         raw_edge = abs(raw_edge)
         market_price = 1.0 - market_price  # Use NO price
         agent_prob = 1.0 - agent_prob
+
+    # Subtract round-trip fee impact from raw edge
+    if fee_rate > 0:
+        fee_per_share = compute_taker_fee(market_price, fee_rate, fee_exponent)
+        # Round-trip: pay fee on entry and exit
+        raw_edge -= 2 * fee_per_share
 
     # Adjusted edge: scale by confidence width
     confidence_width = estimate.confidence_high - estimate.confidence_low
@@ -88,9 +110,14 @@ def build_recommendation(
     estimate: ProbabilityEstimate,
     bankroll: float,
     current_exposure: float = 0.0,
+    clob_midpoint: float | None = None,
+    fee_rate: float = 0.0,
+    fee_exponent: float = 1.0,
 ) -> TradeRecommendation | None:
     """Build a trade recommendation if edge exceeds threshold."""
-    raw_edge, adjusted_edge, side = compute_edge(estimate, market)
+    raw_edge, adjusted_edge, side = compute_edge(
+        estimate, market, fee_rate=fee_rate, fee_exponent=fee_exponent,
+    )
 
     if adjusted_edge < settings.min_edge_threshold:
         logger.info(
@@ -101,8 +128,13 @@ def build_recommendation(
         )
         return None
 
-    # Determine the price we're trading at
-    if side == Side.YES:
+    # Determine the price we're trading at — prefer CLOB midpoint over stale Gamma price
+    if clob_midpoint is not None:
+        if side == Side.YES:
+            market_price = clob_midpoint
+        else:
+            market_price = 1.0 - clob_midpoint
+    elif side == Side.YES:
         market_price = market.last_price_yes or 0.5
     else:
         market_price = market.last_price_no or 0.5

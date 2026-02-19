@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime, timedelta
 
+from polymarket_agent.market.clob_client import ClobClient
 from polymarket_agent.market.gamma_client import GammaClient
 from polymarket_agent.models import Market, ResearchDossier
 from polymarket_agent.research.sources.domain.base import DomainSource
@@ -20,10 +21,12 @@ class ResearchGatherer:
         web_searcher: WebSearcher | None = None,
         polymarket_research: PolymarketResearch | None = None,
         gamma_client: GammaClient | None = None,
+        clob_client: ClobClient | None = None,
         cache_max_age_minutes: int = 60,
     ):
         self.web = web_searcher or WebSearcher()
         self._gamma = gamma_client or GammaClient()
+        self.clob = clob_client
         self.poly = polymarket_research or PolymarketResearch(self._gamma)
         self.cache_max_age = timedelta(minutes=cache_max_age_minutes)
         self._cache: dict[str, ResearchDossier] = {}
@@ -37,7 +40,7 @@ class ResearchGatherer:
     def register_domain_source(self, source: DomainSource):
         self._domain_sources[source.category.lower()] = source
 
-    def gather(self, market: Market) -> ResearchDossier:
+    def gather(self, market: Market, token_id: str | None = None) -> ResearchDossier:
         """Build a research dossier for a market, using cache if available."""
         # Check cache
         cached = self._cache.get(market.id)
@@ -48,9 +51,22 @@ class ResearchGatherer:
 
         logger.info("Gathering research for: %s", market.question[:60])
 
-        # Web search
+        # Web search — primary query
         query = self.web.build_query(market.question, market.category)
         search_results = self.web.search(query)
+
+        # Web search — second temporal/forecast query
+        year = datetime.utcnow().year
+        category_prefix = f"{market.category} " if market.category else ""
+        temporal_query = f"{category_prefix}{market.question[:80]} latest news forecast {year}"
+        temporal_results = self.web.search(temporal_query)
+
+        # Deduplicate by URL
+        seen_urls = {r.url for r in search_results}
+        for r in temporal_results:
+            if r.url not in seen_urls:
+                search_results.append(r)
+                seen_urls.add(r.url)
 
         # Polymarket comments
         comments = self.poly.fetch_comments(market.id)
@@ -66,6 +82,17 @@ class ResearchGatherer:
             if source:
                 domain_data = source.gather(market.question, market.description)
 
+        # CLOB price history
+        price_history: list[dict] = []
+        tid = token_id or market.outcome_yes_token
+        if self.clob and tid:
+            try:
+                history = self.clob.get_prices_history(tid, interval="1w", fidelity=60)
+                if history:
+                    price_history = history
+            except Exception as e:
+                logger.debug("Price history unavailable for %s: %s", market.id[:8], e)
+
         dossier = ResearchDossier(
             market_id=market.id,
             market_question=market.question,
@@ -79,6 +106,7 @@ class ResearchGatherer:
             comment_sentiment_summary=sentiment,
             related_markets=related,
             domain_data=domain_data,
+            price_history=price_history,
             created_at=datetime.utcnow(),
             cached=False,
         )
@@ -113,6 +141,15 @@ class ResearchGatherer:
             )
         parts.append("")
 
+        # Price history summary
+        if dossier.price_history:
+            parts.append("## Price History (1 week)")
+            summary = _summarize_price_history(dossier.price_history)
+            if summary:
+                for line in summary:
+                    parts.append(line)
+            parts.append("")
+
         # Web search results
         if dossier.web_search_results:
             parts.append("## Web Search Results")
@@ -120,7 +157,7 @@ class ResearchGatherer:
             for i, result in enumerate(dossier.web_search_results, 1):
                 parts.append(f"### {i}. {result.title}")
                 parts.append(f"Source: {result.url}")
-                parts.append(result.content[:500])
+                parts.append(result.content[:2000])
                 parts.append("")
 
         # Comments
@@ -149,3 +186,41 @@ class ResearchGatherer:
             parts.append("")
 
         return "\n".join(parts)
+
+
+def _summarize_price_history(history: list[dict]) -> list[str]:
+    """Summarize CLOB price history into human-readable lines."""
+    if not history:
+        return []
+
+    prices = []
+    for point in history:
+        try:
+            p = float(point.get("p", point.get("price", 0)))
+            if p > 0:
+                prices.append(p)
+        except (ValueError, TypeError):
+            continue
+
+    if not prices:
+        return []
+
+    open_price = prices[0]
+    close_price = prices[-1]
+    high = max(prices)
+    low = min(prices)
+    change = close_price - open_price
+    pct_change = (change / open_price * 100) if open_price > 0 else 0
+
+    if change > 0.01:
+        trend = "upward"
+    elif change < -0.01:
+        trend = "downward"
+    else:
+        trend = "flat"
+
+    return [
+        f"- Open: {open_price:.3f}, Current: {close_price:.3f}",
+        f"- High: {high:.3f}, Low: {low:.3f}",
+        f"- Trend: {trend} ({change:+.3f}, {pct_change:+.1f}%)",
+    ]

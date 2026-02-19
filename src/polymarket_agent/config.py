@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     max_category_exposure: float = 200.0
     daily_loss_limit: float = -50.0
     max_slippage: float = 0.02
+    default_fee_rate: float = 0.0  # Polymarket taker fee rate (0.0 = free)
+    default_fee_exponent: float = 1.0  # Fee formula exponent
+
+    # --- Opportunity Scoring Weights ---
+    opportunity_weight_price: float = 0.20
+    opportunity_weight_volume: float = 0.25
+    opportunity_weight_event: float = 0.20
+    opportunity_weight_screen: float = 0.15
+    opportunity_weight_time: float = 0.10
+    opportunity_weight_calibration: float = 0.10
 
     # --- Paper Trading ---
     paper_starting_balance: float = 1000.0

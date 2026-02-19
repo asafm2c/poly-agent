@@ -242,6 +242,8 @@ def _parse_market(data: dict) -> Market | None:
             last_updated_at=datetime.utcnow(),
             event_id=data.get("events", [{}])[0].get("id") if data.get("events") else None,
             event_title=data.get("events", [{}])[0].get("title") if data.get("events") else None,
+            maker_base_fee=float(data.get("maker_base_fee") or data.get("makerBaseFee") or 0),
+            taker_base_fee=float(data.get("taker_base_fee") or data.get("takerBaseFee") or 0),
         )
     except Exception as e:
         logger.warning("Failed to parse market: %s - %s", data.get("id", "unknown"), e)

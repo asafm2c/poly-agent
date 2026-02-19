@@ -56,6 +56,8 @@ class Market(BaseModel):
     last_updated_at: datetime | None = None
     event_id: str | None = None
     event_title: str | None = None
+    maker_base_fee: float = 0.0
+    taker_base_fee: float = 0.0
 
 
 class MarketEvent(BaseModel):
@@ -121,6 +123,7 @@ class ResearchDossier(BaseModel):
     comment_sentiment_summary: str | None = None
     related_markets: list[dict] = Field(default_factory=list)
     domain_data: dict | None = None
+    price_history: list[dict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     cached: bool = False
 

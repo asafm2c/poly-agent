@@ -28,8 +28,11 @@ class ProbabilityEstimator:
         self.llm = llm_client or LLMClient()
         self.research = research_gatherer or ResearchGatherer()
 
-    def screen(self, market: Market) -> tuple[bool, str | None]:
-        """Quick screen with Haiku to determine if a market is worth deep analysis."""
+    def screen(self, market: Market) -> dict:
+        """Quick screen with Haiku to determine if a market is worth deep analysis.
+
+        Returns dict with keys: worth_analyzing, reasoning, initial_direction, confidence.
+        """
         prompt = SCREENING_PROMPT.format(
             question=market.question,
             category=market.category or "Unknown",
@@ -49,16 +52,30 @@ class ProbabilityEstimator:
             )
             worth = result.get("worth_analyzing", False)
             reasoning = result.get("reasoning", "")
+            direction = result.get("initial_direction", "fair")
+            confidence = result.get("confidence", "low")
             logger.info(
-                "Screen %s: %s - %s",
+                "Screen %s: %s (%s/%s) - %s",
                 market.id[:8],
                 "PASS" if worth else "SKIP",
+                direction,
+                confidence,
                 reasoning[:80],
             )
-            return worth, reasoning
+            return {
+                "worth_analyzing": worth,
+                "reasoning": reasoning,
+                "initial_direction": direction,
+                "confidence": confidence,
+            }
         except Exception as e:
-            logger.error("Screening failed for %s: %s", market.id, e)
-            return True, f"Screening failed ({e}), proceeding with analysis"
+            logger.warning("Screening failed for %s: %s", market.id, e)
+            return {
+                "worth_analyzing": False,
+                "reasoning": f"Screening failed: {e}",
+                "initial_direction": "fair",
+                "confidence": "low",
+            }
 
     def estimate(
         self, market: Market, calibration_text: str | None = None

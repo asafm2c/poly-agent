@@ -642,3 +642,309 @@ class TestDailyPnL:
         result = rm._check_daily_loss()
         assert not result.passed
         assert "daily loss" in result.reason.lower()
+
+
+# --- Alpha Cultivation Tests ---
+
+
+class TestFeeComputation:
+    """7.1: Test fee computation matches Polymarket formula."""
+
+    def test_fee_at_midprice(self):
+        from polymarket_agent.trading.edge import compute_taker_fee
+
+        # At price=0.50, fee_rate=0.0175, exponent=1:
+        # fee = 0.50 * 0.0175 * (0.50 * 0.50)^1 = 0.50 * 0.0175 * 0.25 = 0.0021875
+        fee = compute_taker_fee(0.50, 0.0175, 1.0)
+        assert fee == pytest.approx(0.0021875)
+
+    def test_fee_at_extreme_price(self):
+        from polymarket_agent.trading.edge import compute_taker_fee
+
+        # At price=0.10: fee = 0.10 * 0.0175 * (0.10 * 0.90)^1 = 0.10 * 0.0175 * 0.09
+        fee = compute_taker_fee(0.10, 0.0175, 1.0)
+        assert fee == pytest.approx(0.10 * 0.0175 * 0.09)
+
+    def test_fee_at_090(self):
+        from polymarket_agent.trading.edge import compute_taker_fee
+
+        fee = compute_taker_fee(0.90, 0.0175, 1.0)
+        assert fee == pytest.approx(0.90 * 0.0175 * (0.90 * 0.10))
+
+    def test_zero_fee_rate(self):
+        from polymarket_agent.trading.edge import compute_taker_fee
+
+        assert compute_taker_fee(0.50, 0.0, 1.0) == 0.0
+
+    def test_crypto_fee_exponent_2(self):
+        from polymarket_agent.trading.edge import compute_taker_fee
+
+        # Crypto markets use exponent=2
+        fee = compute_taker_fee(0.50, 0.25, 2.0)
+        # 0.50 * 0.25 * (0.50 * 0.50)^2 = 0.50 * 0.25 * 0.0625 = 0.0078125
+        assert fee == pytest.approx(0.0078125)
+
+
+class TestFeeAdjustedEdge:
+    """7.2: Test fee-adjusted edge computation."""
+
+    def test_edge_reduced_by_fees(self):
+        from polymarket_agent.models import ProbabilityEstimate
+        from polymarket_agent.trading.edge import compute_edge
+
+        _create_test_market("fee-edge-001", 0.40)
+        from polymarket_agent.market.storage import get_market
+        market = get_market("fee-edge-001")
+
+        estimate = ProbabilityEstimate(
+            market_id="fee-edge-001",
+            final_estimate=0.52,  # 12% raw edge
+            confidence_low=0.42,
+            confidence_high=0.62,
+            base_rate=0.50,
+            updated_estimate=0.52,
+            pass1_reasoning="test",
+            pass2_reasoning="test",
+            thesis="test",
+        )
+
+        # Without fees
+        raw_no_fee, adj_no_fee, _ = compute_edge(estimate, market, fee_rate=0.0)
+
+        # With fees
+        raw_with_fee, adj_with_fee, _ = compute_edge(estimate, market, fee_rate=0.0175)
+
+        assert raw_with_fee < raw_no_fee
+        assert adj_with_fee < adj_no_fee
+
+
+class TestOpportunityScoring:
+    """7.3: Test opportunity scoring signals."""
+
+    def test_mid_volume_scores_higher(self):
+        from polymarket_agent.market.scoring import volume_score
+
+        low_vol = volume_score(20_000, 10_000_000)
+        high_vol = volume_score(5_000_000, 10_000_000)
+        assert low_vol > high_vol
+
+    def test_mid_price_scores_higher(self):
+        from polymarket_agent.market.scoring import price_score
+
+        mid = price_score(0.45)
+        extreme = price_score(0.88)
+        assert mid > extreme
+
+    def test_price_score_peaks_at_50(self):
+        from polymarket_agent.market.scoring import price_score
+
+        assert price_score(0.50) == pytest.approx(1.0)
+        assert price_score(0.10) == pytest.approx(0.2)
+        assert price_score(0.90) == pytest.approx(0.2)
+
+    def test_event_score(self):
+        from polymarket_agent.market.scoring import event_score
+        from polymarket_agent.models import MarketEvent
+
+        events = [MarketEvent(market_id="m1", event_type="price_change")]
+        assert event_score("m1", events) == 1.0
+        assert event_score("m2", events) == 0.0
+
+    def test_screening_score(self):
+        from polymarket_agent.market.scoring import screening_score
+
+        assert screening_score("fair", "low") == 0.0
+        assert screening_score("higher", "high") == 1.0
+        assert screening_score("lower", "medium") == 0.75
+        assert screening_score("higher", "low") == 0.5
+
+    def test_time_score(self):
+        from polymarket_agent.market.scoring import time_score
+
+        near = time_score(5)
+        far = time_score(50)
+        assert near > far
+
+    def test_composite_score(self):
+        from polymarket_agent.market.scoring import score_candidates
+        from polymarket_agent.models import MarketEvent
+
+        m_low_vol = _create_test_market("score-lo", 0.45)
+        m_low_vol.volume = 20_000
+
+        m_high_vol = _create_test_market("score-hi", 0.45)
+        m_high_vol.volume = 5_000_000
+
+        events = [MarketEvent(market_id="score-lo", event_type="price_change")]
+        screening = {
+            "score-lo": {"initial_direction": "higher", "confidence": "high"},
+            "score-hi": {"initial_direction": "fair", "confidence": "low"},
+        }
+
+        scored = score_candidates([m_low_vol, m_high_vol], events, screening)
+        # Low-volume market with events and screening signal should rank first
+        assert scored[0][0].id == "score-lo"
+        assert scored[0][1] > scored[1][1]
+
+
+class TestScreeningSignalExtraction:
+    """7.4: Test screening signal extraction."""
+
+    def test_screen_returns_dict(self):
+        """Verify screen() returns a dict with all expected keys."""
+        from unittest.mock import patch
+
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+
+        m = _create_test_market("screen-001", 0.50)
+        estimator = ProbabilityEstimator()
+
+        mock_result = {
+            "worth_analyzing": True,
+            "reasoning": "Looks mispriced",
+            "initial_direction": "higher",
+            "confidence": "high",
+        }
+
+        with patch.object(estimator.llm, "complete_json", return_value=mock_result):
+            result = estimator.screen(m)
+
+        assert isinstance(result, dict)
+        assert result["worth_analyzing"] is True
+        assert result["initial_direction"] == "higher"
+        assert result["confidence"] == "high"
+
+    def test_screen_defaults_on_missing_fields(self):
+        from unittest.mock import patch
+
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+
+        m = _create_test_market("screen-002", 0.50)
+        estimator = ProbabilityEstimator()
+
+        # LLM returns only basic fields
+        mock_result = {"worth_analyzing": True, "reasoning": "ok"}
+
+        with patch.object(estimator.llm, "complete_json", return_value=mock_result):
+            result = estimator.screen(m)
+
+        assert result["initial_direction"] == "fair"
+        assert result["confidence"] == "low"
+
+
+class TestPriceHistoryDossier:
+    """7.5: Test price history dossier formatting."""
+
+    def test_price_history_summary(self):
+        from polymarket_agent.research.gatherer import _summarize_price_history
+
+        history = [
+            {"p": 0.300},
+            {"p": 0.350},
+            {"p": 0.400},
+            {"p": 0.550},
+        ]
+        summary = _summarize_price_history(history)
+        assert len(summary) == 3
+        assert "0.300" in summary[0]  # Open
+        assert "0.550" in summary[0]  # Current
+        assert "upward" in summary[2]
+
+    def test_empty_price_history(self):
+        from polymarket_agent.research.gatherer import _summarize_price_history
+
+        assert _summarize_price_history([]) == []
+
+
+class TestFailClosedScreening:
+    """7.6: Test fail-closed screening."""
+
+    def test_exception_returns_not_worth(self):
+        from unittest.mock import patch
+
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+
+        m = _create_test_market("screen-fail-001", 0.50)
+        estimator = ProbabilityEstimator()
+
+        with patch.object(estimator.llm, "complete_json", side_effect=Exception("API error")):
+            result = estimator.screen(m)
+
+        assert result["worth_analyzing"] is False
+        assert result["initial_direction"] == "fair"
+
+
+class TestClobMidpointFallback:
+    """7.7: Test CLOB midpoint fallback."""
+
+    def test_midpoint_used_when_available(self):
+        from polymarket_agent.models import ProbabilityEstimate
+        from polymarket_agent.trading.edge import build_recommendation
+
+        m = _create_test_market("clob-001", 0.40)
+        from polymarket_agent.market.storage import get_market
+        market = get_market("clob-001")
+
+        estimate = ProbabilityEstimate(
+            market_id="clob-001",
+            final_estimate=0.60,
+            confidence_low=0.50,
+            confidence_high=0.70,
+            base_rate=0.50,
+            updated_estimate=0.60,
+            pass1_reasoning="test",
+            pass2_reasoning="test",
+            thesis="test",
+        )
+
+        rec = build_recommendation(market, estimate, 1000.0, clob_midpoint=0.42)
+        assert rec is not None
+        # Limit price should reflect the midpoint, not the Gamma price
+        assert rec.limit_price == pytest.approx(0.42, abs=0.01)
+
+    def test_gamma_price_used_when_no_midpoint(self):
+        from polymarket_agent.models import ProbabilityEstimate
+        from polymarket_agent.trading.edge import build_recommendation
+
+        m = _create_test_market("clob-002", 0.40)
+        from polymarket_agent.market.storage import get_market
+        market = get_market("clob-002")
+
+        estimate = ProbabilityEstimate(
+            market_id="clob-002",
+            final_estimate=0.60,
+            confidence_low=0.50,
+            confidence_high=0.70,
+            base_rate=0.50,
+            updated_estimate=0.60,
+            pass1_reasoning="test",
+            pass2_reasoning="test",
+            thesis="test",
+        )
+
+        rec = build_recommendation(market, estimate, 1000.0, clob_midpoint=None)
+        assert rec is not None
+        assert rec.limit_price == pytest.approx(0.40, abs=0.01)
+
+
+class TestPortfolioExposure:
+    """7.8: Test portfolio exposure passed correctly."""
+
+    def test_exposure_reduces_position_size(self):
+        from polymarket_agent.trading.edge import kelly_position_size
+
+        # With zero exposure — use high max_per_market so portfolio cap is the binding constraint
+        size_no_exp = kelly_position_size(
+            0.15, 0.40, 1000.0, current_exposure=0.0,
+            max_per_market=500.0, max_portfolio=500.0,
+        )
+
+        # With $400 existing exposure (close to $500 max)
+        size_with_exp = kelly_position_size(
+            0.15, 0.40, 1000.0, current_exposure=400.0,
+            max_per_market=500.0, max_portfolio=500.0,
+        )
+
+        # The position with exposure should be smaller due to portfolio cap
+        assert size_with_exp < size_no_exp
+        assert size_with_exp <= 100.0  # Max $500 - $400 = $100

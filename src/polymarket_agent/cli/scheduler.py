@@ -10,12 +10,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from polymarket_agent.analyst.estimator import ProbabilityEstimator
 from polymarket_agent.config import settings
+from polymarket_agent.market.clob_client import ClobClient
 from polymarket_agent.market.scanner import MarketScanner
+from polymarket_agent.market.scoring import score_candidates
 from polymarket_agent.market.storage import (
     get_open_position_market_ids,
     get_unresolved_prediction_market_ids,
 )
-from polymarket_agent.models import Market
+from polymarket_agent.models import Market, MarketEvent
 from polymarket_agent.risk.manager import RiskManager
 from polymarket_agent.storage.snapshots import (
     cleanup_old_snapshots,
@@ -51,11 +53,13 @@ class AgentScheduler:
     def __init__(self, mode: str = "paper"):
         self.mode = mode
         self.scanner = MarketScanner()
+        self.clob = ClobClient()
         self.estimator = ProbabilityEstimator()
         self.risk = RiskManager()
         self.paper = PaperTrader()
         self._scheduler = BlockingScheduler()
         self._candidates: list[Market] = []
+        self._last_events: list[MarketEvent] = []
         self._running = False
         self._lock = threading.Lock()
 
@@ -129,6 +133,7 @@ class AgentScheduler:
         with self._lock:
             candidates, events = self.scanner.scan()
             self._candidates = candidates
+            self._last_events = events
 
         if events:
             logger.info("Detected %d events", len(events))
@@ -199,37 +204,73 @@ class AgentScheduler:
                 )
 
     def _analysis_job(self):
-        """Analyze candidate markets and generate trade recommendations."""
+        """Analyze candidate markets using opportunity-scored pipeline.
+
+        Flow: screen all → score → sort by score → analyze top-N.
+        """
         if not self._running or self.risk.is_kill_switch_active():
             return
 
         with self._lock:
             candidates = list(self._candidates)
+            events = list(self._last_events)
 
         if not candidates:
             logger.info("No candidates for analysis")
             return
 
         cap = settings.max_analyses_per_cycle
-        if cap > 0:
-            logger.info("Running analysis on %d candidates (cap: %d)...", len(candidates), cap)
-        else:
-            logger.info("Running analysis on %d candidates...", len(candidates))
-        calibration_text = export_calibration_for_llm()
-        bankroll = self.paper.get_cash_balance()
-        analyzed = 0
+        logger.info(
+            "Running analysis: %d candidates, screening all, analyzing top %d...",
+            len(candidates), cap if cap > 0 else len(candidates),
+        )
+
+        # Phase 1: Screen all candidates, collecting signals
+        screening_results: dict[str, dict] = {}
+        screened_candidates: list[Market] = []
 
         for market in candidates:
+            if not self._running:
+                return
+            result = self.estimator.screen(market)
+            screening_results[market.id] = result
+            if result["worth_analyzing"]:
+                screened_candidates.append(market)
+
+        logger.info(
+            "Screening complete: %d/%d passed",
+            len(screened_candidates), len(candidates),
+        )
+
+        if not screened_candidates:
+            return
+
+        # Phase 2: Score and sort by opportunity
+        scored = score_candidates(screened_candidates, events, screening_results)
+
+        # Log top candidates
+        for market, score in scored[:5]:
+            logger.info(
+                "  Top candidate: %s (score=%.3f, vol=$%.0f, price=%.2f) %s",
+                market.id[:8], score, market.volume,
+                market.last_price_yes or 0, market.question[:50],
+            )
+
+        # Phase 3: Analyze top-N
+        calibration_text = export_calibration_for_llm()
+        bankroll = self.paper.get_cash_balance()
+
+        # Compute actual portfolio exposure for Kelly sizing
+        portfolio_summary = self.paper.get_portfolio_summary()
+        current_exposure = portfolio_summary.total_position_value
+
+        analyzed = 0
+        for market, score in scored:
             if not self._running:
                 break
             if cap > 0 and analyzed >= cap:
                 logger.info("Analysis cap reached (%d), deferring remaining candidates", cap)
                 break
-
-            # Screen first
-            worth, reasoning = self.estimator.screen(market)
-            if not worth:
-                continue
             analyzed += 1
 
             # Full estimation
@@ -242,14 +283,30 @@ class AgentScheduler:
             # Record prediction
             record_prediction(estimate, market.last_price_yes or 0.5, market.category)
 
-            # Build recommendation
-            rec = build_recommendation(market, estimate, bankroll)
+            # Get CLOB midpoint for accurate pricing
+            token_id = market.outcome_yes_token
+            midpoint = None
+            if token_id:
+                midpoint = self.clob.get_midpoint(token_id)
+
+            # Get per-market fee rate
+            fee_rate = market.taker_base_fee or settings.default_fee_rate
+            fee_exponent = settings.default_fee_exponent
+
+            # Build recommendation with real exposure, midpoint, and fees
+            rec = build_recommendation(
+                market, estimate, bankroll,
+                current_exposure=current_exposure,
+                clob_midpoint=midpoint,
+                fee_rate=fee_rate,
+                fee_exponent=fee_exponent,
+            )
             if not rec:
                 continue
 
             # Risk checks
-            token_id = market.outcome_yes_token if rec.side.value == "YES" else market.outcome_no_token
-            risk_result = self.risk.check_all(rec, market.category, token_id)
+            risk_token = token_id if rec.side.value == "YES" else market.outcome_no_token
+            risk_result = self.risk.check_all(rec, market.category, risk_token)
 
             if not risk_result.passed:
                 logger.info("Risk rejected trade on %s: %s", market.id[:8], risk_result.reason)
@@ -262,7 +319,12 @@ class AgentScheduler:
             if self.mode == "paper":
                 trade = self.paper.execute_trade(rec)
                 if trade:
-                    logger.info("Paper trade executed: %s %s $%.2f", rec.side.value, market.id[:8], rec.recommended_size)
+                    logger.info(
+                        "Paper trade executed: %s %s $%.2f (score=%.3f)",
+                        rec.side.value, market.id[:8], rec.recommended_size, score,
+                    )
+                    # Update exposure for next iteration
+                    current_exposure += rec.recommended_size
             else:
                 from polymarket_agent.trading.executor import LiveExecutor
                 executor = LiveExecutor()
