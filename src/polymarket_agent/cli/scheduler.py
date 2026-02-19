@@ -31,6 +31,7 @@ from polymarket_agent.trading.calibration import (
     record_prediction,
     update_prediction_outcome,
 )
+from polymarket_agent.backtest.strategy import load_strategy_config
 from polymarket_agent.trading.edge import build_recommendation
 from polymarket_agent.trading.paper import PaperTrader
 
@@ -62,6 +63,20 @@ class AgentScheduler:
         self._last_events: list[MarketEvent] = []
         self._running = False
         self._lock = threading.Lock()
+        self.strategy_config = load_strategy_config()
+
+        # Log active strategy
+        ms = self.strategy_config.get("market_selection", {})
+        et = self.strategy_config.get("edge_thresholds", {})
+        ra = self.strategy_config.get("regime_awareness", {})
+        logger.info(
+            "Strategy config v%d: targets=%s, avoids=%s, overrides=%s, regime=%s",
+            self.strategy_config.get("version", 0),
+            ms.get("target_categories") or "all",
+            ms.get("avoid_categories") or "none",
+            et.get("category_overrides") or "none",
+            ra.get("current_regime", "unvalidated"),
+        )
 
     def start(self):
         """Start the scheduler with configured intervals."""
@@ -224,6 +239,26 @@ class AgentScheduler:
             logger.info("No candidates for analysis")
             return
 
+        # Apply strategy category filters
+        ms = self.strategy_config.get("market_selection", {})
+        target_cats = ms.get("target_categories") or []
+        avoid_cats = ms.get("avoid_categories") or []
+        if target_cats or avoid_cats:
+            pre_filter = len(candidates)
+            if target_cats:
+                candidates = [m for m in candidates if m.category in target_cats]
+            if avoid_cats:
+                candidates = [m for m in candidates if m.category not in avoid_cats]
+            if len(candidates) != pre_filter:
+                logger.info(
+                    "Strategy filter: %d → %d candidates (target=%s, avoid=%s)",
+                    pre_filter, len(candidates), target_cats or "all", avoid_cats or "none",
+                )
+
+        if not candidates:
+            logger.info("No candidates after strategy filtering")
+            return
+
         cap = settings.max_analyses_per_cycle
         logger.info(
             "Running analysis (%s): %d candidates, screening all, analyzing top %d...",
@@ -315,6 +350,7 @@ class AgentScheduler:
                 clob_midpoint=midpoint,
                 fee_rate=fee_rate,
                 fee_exponent=fee_exponent,
+                strategy_config=self.strategy_config,
             )
 
             # Record prediction with edge/threshold data (before trade decision)
@@ -543,4 +579,53 @@ class AgentScheduler:
             logger.info("Snapshot cleanup: %d old records removed", deleted)
         if metrics_deleted:
             logger.info("Metrics cleanup: %d old events removed", metrics_deleted)
+
+        # Strategy drift monitoring
+        self._check_strategy_drift()
+
         logger.info("=== END REPORT ===")
+
+    def _check_strategy_drift(self):
+        """Compare per-category Brier scores against strategy expectations."""
+        from polymarket_agent.storage.database import get_db
+
+        et = self.strategy_config.get("edge_thresholds", {})
+        overrides = et.get("category_overrides", {})
+        if not overrides:
+            return
+
+        # Expected efficiency baseline: 0.25 (coin-flip). Categories with overrides
+        # imply the strategy believes they deviate from this.
+        expected_brier = 0.25
+
+        with get_db() as conn:
+            rows = conn.execute(
+                """SELECT category, AVG((agent_estimate - outcome) * (agent_estimate - outcome)) as brier,
+                          COUNT(*) as count
+                FROM predictions
+                WHERE outcome IS NOT NULL AND category IS NOT NULL
+                GROUP BY category"""
+            ).fetchall()
+
+        for row in rows:
+            cat = row["category"]
+            count = row["count"]
+            brier = row["brier"]
+
+            if count < 10:
+                logger.info(
+                    "Strategy drift: insufficient data for %s (%d predictions)",
+                    cat, count,
+                )
+                continue
+
+            if cat in overrides:
+                drift = brier - expected_brier
+                if abs(drift) > 0.05:
+                    logger.warning(
+                        "Strategy drift: %s Brier=%.4f vs expected=%.4f (drift=%+.4f). "
+                        "Research review recommended.",
+                        cat, brier, expected_brier, drift,
+                    )
+                else:
+                    logger.info("Strategy aligned: %s Brier=%.4f", cat, brier)

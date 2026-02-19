@@ -84,6 +84,8 @@ class Settings(BaseSettings):
 
     # --- Storage ---
     db_path: Path = Path("polymarket_agent.db")
+    backtest_db_path: Path = Path("backtest.db")
+    strategy_config_path: Path = Path("strategy.yaml")
 
     # --- Polymarket API ---
     gamma_api_url: str = "https://gamma-api.polymarket.com"

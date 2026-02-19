@@ -19,14 +19,26 @@ def compute_required_edge(
     confidence_width: float = 0.30,
     spread_width: float = 0.0,
     category_brier: float | None = None,
+    strategy_config: dict | None = None,
 ) -> float:
     """Compute per-market edge threshold based on market efficiency.
 
     Scales by volume (higher volume = higher threshold), confidence width
     (wider band = higher threshold), and calibration quality (better Brier
     = lower threshold). Clamped to [min_edge_floor, max_edge_ceiling].
+
+    If strategy_config is provided and contains a category override for this
+    market's category, that override is used as the base threshold.
     """
     base = settings.min_edge_threshold  # 0.10 default
+
+    # Strategy config category override takes precedence
+    if strategy_config and market.category:
+        overrides = (
+            strategy_config.get("edge_thresholds", {}).get("category_overrides", {})
+        )
+        if market.category in overrides:
+            base = float(overrides[market.category])
 
     # Volume factor: scale up for high-volume (efficient) markets
     vol = max(market.volume, 1.0)
@@ -157,6 +169,7 @@ def build_recommendation(
     fee_exponent: float = 1.0,
     spread_width: float = 0.0,
     category_brier: float | None = None,
+    strategy_config: dict | None = None,
 ) -> tuple[TradeRecommendation | None, float, float]:
     """Build a trade recommendation if edge exceeds adaptive threshold.
 
@@ -169,6 +182,7 @@ def build_recommendation(
     confidence_width = estimate.confidence_high - estimate.confidence_low
     required_edge = compute_required_edge(
         market, confidence_width, spread_width, category_brier,
+        strategy_config=strategy_config,
     )
 
     if adjusted_edge < required_edge:

@@ -18,7 +18,7 @@ The system SHALL run market scanning at a configurable interval (default every 1
 - **THEN** `update_prediction_outcome()` is called with outcome=0.0 and `resolve_positions()` is called with outcome="NO"
 
 ### Requirement: Opportunity-scored analysis pipeline
-The analysis job SHALL screen all candidates first, then score and rank them by opportunity, then analyze the top-N with full estimation including the adversarial pass. The analysis job SHALL pass actual portfolio exposure to the edge computation instead of a hardcoded value. In `predict` mode, the analysis job SHALL record predictions for all analyzed markets but SHALL NOT build trade recommendations or execute trades. In `paper` and `live` modes, predictions SHALL be recorded for all analyzed markets regardless of edge threshold, and trade recommendations SHALL be built only when the adaptive edge threshold is met.
+The analysis job SHALL screen all candidates first, then score and rank them by opportunity, then analyze the top-N with full estimation including the adversarial pass. The analysis job SHALL pass actual portfolio exposure to the edge computation instead of a hardcoded value. In `predict` mode, the analysis job SHALL record predictions for all analyzed markets but SHALL NOT build trade recommendations or execute trades. In `paper` and `live` modes, predictions SHALL be recorded for all analyzed markets regardless of edge threshold, and trade recommendations SHALL be built only when the adaptive edge threshold is met. When a strategy configuration is loaded, the analysis job SHALL apply category targeting and avoidance rules before screening.
 
 #### Scenario: Screen-then-score-then-analyze flow
 - **WHEN** the analysis job runs with N candidates
@@ -27,6 +27,18 @@ The analysis job SHALL screen all candidates first, then score and rank them by 
 #### Scenario: Portfolio exposure passed to edge computation
 - **WHEN** a trade recommendation is built for a market
 - **THEN** the current total portfolio exposure (sum of open position costs) is passed to the Kelly sizing function, not 0.0
+
+#### Scenario: Strategy category targeting applied
+- **WHEN** `strategy.yaml` specifies `target_categories: ["crypto", "science"]`
+- **THEN** only markets in those categories are considered as candidates, before screening
+
+#### Scenario: Strategy category avoidance applied
+- **WHEN** `strategy.yaml` specifies `avoid_categories: ["politics"]`
+- **THEN** politics markets are excluded from candidates, before screening
+
+#### Scenario: No strategy config uses all categories
+- **WHEN** no `strategy.yaml` exists or it specifies no category rules
+- **THEN** all categories are considered as candidates (existing default behavior)
 
 #### Scenario: Detected events used in scoring
 - **WHEN** the scan detected events for markets that are also candidates
@@ -63,7 +75,7 @@ The analysis job SHALL subtract estimated taker fees from the raw edge before co
 - **THEN** the fee deduction is 0.0 (no impact on edge)
 
 ### Requirement: Adaptive edge threshold scales by market efficiency
-The system SHALL compute a per-market edge threshold based on market efficiency signals instead of using a flat minimum edge. Higher-volume, narrower-spread markets SHALL require more edge. Markets in well-calibrated categories SHALL require less edge. The threshold SHALL be bounded by configurable floor and ceiling values.
+The system SHALL compute a per-market edge threshold based on market efficiency signals instead of using a flat minimum edge. Higher-volume, narrower-spread markets SHALL require more edge. Markets in well-calibrated categories SHALL require less edge. The threshold SHALL be bounded by configurable floor and ceiling values. When a strategy configuration is loaded, per-category edge threshold overrides from the strategy SHALL take precedence over computed defaults.
 
 #### Scenario: High-volume market requires more edge
 - **WHEN** a market has $5M volume and narrow spread
@@ -84,6 +96,10 @@ The system SHALL compute a per-market edge threshold based on market efficiency 
 #### Scenario: Well-calibrated category reduces required edge
 - **WHEN** the agent has 20+ resolved predictions in a category with a Brier score better than 0.25
 - **THEN** the required edge threshold for markets in that category is reduced, reflecting demonstrated estimation accuracy
+
+#### Scenario: Strategy config category override applied
+- **WHEN** `strategy.yaml` specifies an edge threshold override for a market's category
+- **THEN** `compute_required_edge()` uses the strategy-specified threshold as the base instead of the default computed value
 
 ### Requirement: CLOB midpoint pricing
 The analysis job SHALL use the CLOB API midpoint price for edge computation and limit price setting when available. The Gamma API last-trade price SHALL be used as a fallback.
@@ -145,7 +161,7 @@ The system SHALL re-evaluate open positions at a configurable interval (default 
 - **THEN** the cycle is skipped and logged
 
 ### Requirement: Daily portfolio report
-The system SHALL generate a daily portfolio report at a configurable time (default 18:00 UTC) summarizing the day's activity, P&L, calibration metrics, and Brier score comparison. The report SHALL also compute and persist daily P&L to the `daily_pnl` table, and run price snapshot cleanup.
+The system SHALL generate a daily portfolio report at a configurable time (default 18:00 UTC) summarizing the day's activity, P&L, calibration metrics, and Brier score comparison. The report SHALL also compute and persist daily P&L to the `daily_pnl` table, and run price snapshot cleanup. When a strategy configuration is loaded, the report SHALL include strategy drift monitoring.
 
 #### Scenario: Daily report generation
 - **WHEN** the daily report time is reached
@@ -162,3 +178,7 @@ The system SHALL generate a daily portfolio report at a configurable time (defau
 #### Scenario: Brier comparison in daily report
 - **WHEN** the daily report is generated and 20+ predictions have resolved outcomes
 - **THEN** the report logs the agent's Brier score, the market baseline Brier score, and the difference between them
+
+#### Scenario: Strategy drift monitoring in daily report
+- **WHEN** the daily report is generated and a strategy configuration is loaded
+- **THEN** the report compares per-category Brier scores against strategy expectations and flags categories where actual performance diverges by more than 0.05 from expected, recommending a research review

@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.13.0",
     "rich>=14.3.2",
     "tavily-python>=0.7.21",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

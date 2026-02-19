@@ -401,5 +401,159 @@ def config():
     console.print(table)
 
 
+@cli.group()
+def backtest():
+    """Backtest tools: collect historical data, analyze markets, manage strategy."""
+    pass
+
+
+@backtest.command()
+def collect():
+    """Collect resolved markets and price histories from Polymarket."""
+    from polymarket_agent.backtest.collector import BacktestCollector
+
+    collector = BacktestCollector()
+    try:
+        with console.status("Collecting resolved markets..."):
+            result = collector.collect()
+
+        console.print(f"\n[bold green]Collection complete[/]")
+        console.print(f"  Markets collected: {result['markets_collected']}")
+        console.print(f"  Price histories collected: {result['history_collected']}")
+        console.print(f"  Skipped: {result['history_skipped']}")
+    finally:
+        collector.close()
+
+
+@backtest.command("analyze")
+@click.option("--category", "-c", help="Filter by category")
+@click.option("--regime", "-r", help="Filter by regime (e.g. o1-era, GPT4o-era)")
+@click.option("--horizon", "-h", type=int, default=7, help="Days before resolution (default: 7)")
+@click.option("--volume-min", type=float, help="Minimum volume filter")
+@click.option("--volume-max", type=float, help="Maximum volume filter")
+def analyze_backtest(
+    category: str | None,
+    regime: str | None,
+    horizon: int,
+    volume_min: float | None,
+    volume_max: float | None,
+):
+    """Run analysis on historical market data."""
+    from polymarket_agent.backtest.analysis import (
+        category_calibration,
+        cross_market_arbitrage,
+        efficiency_index,
+        load_markets,
+        market_baseline_brier,
+    )
+
+    with console.status("Loading markets..."):
+        markets = load_markets(
+            category=category,
+            regime=regime,
+            volume_min=volume_min,
+            volume_max=volume_max,
+        )
+
+    if not markets:
+        console.print("[yellow]No markets found matching filters[/]")
+        return
+
+    console.print(f"\n[bold]Loaded {len(markets)} markets[/]")
+    if category:
+        console.print(f"  Category: {category}")
+    if regime:
+        console.print(f"  Regime: {regime}")
+
+    # Market baseline Brier
+    baseline = market_baseline_brier(markets, horizon=horizon)
+    console.print(f"\n[bold]Market Baseline Brier (horizon={horizon}d)[/]")
+    if baseline["brier_score"] is not None:
+        console.print(f"  Brier score: {baseline['brier_score']:.4f} ({baseline['count']} markets)")
+    else:
+        console.print("  [dim]Insufficient data[/]")
+
+    # Efficiency index
+    eff = efficiency_index(markets)
+    console.print(f"\n[bold]Efficiency Index[/]")
+    for h, data in sorted(eff.items()):
+        if data["efficiency"] is not None:
+            console.print(f"  {h:2d}d: {data['efficiency']:.4f} ({data['count']} markets)")
+
+    # Category calibration
+    cal = category_calibration(markets)
+    if cal:
+        cal_table = Table(title="Category Calibration")
+        cal_table.add_column("Category")
+        cal_table.add_column("Avg Price", justify="right")
+        cal_table.add_column("Avg Outcome", justify="right")
+        cal_table.add_column("Bias", justify="right")
+        cal_table.add_column("Count", justify="right")
+
+        for cat, data in sorted(cal.items(), key=lambda x: abs(x[1]["bias"]), reverse=True):
+            bias_style = "red" if abs(data["bias"]) > 0.05 else ""
+            cal_table.add_row(
+                cat,
+                f"{data['avg_price']:.4f}",
+                f"{data['avg_outcome']:.4f}",
+                f"[{bias_style}]{data['bias']:+.4f}[/{bias_style}]" if bias_style else f"{data['bias']:+.4f}",
+                str(data["count"]),
+            )
+        console.print(cal_table)
+
+    # Cross-market arbitrage
+    arb = cross_market_arbitrage(markets)
+    flagged = [a for a in arb if abs(a["deviation"]) > 0.10]
+    if flagged:
+        console.print(f"\n[bold]Cross-Market Arbitrage ({len(flagged)} events flagged)[/]")
+        for a in flagged[:10]:
+            console.print(
+                f"  Event {a['event_id'][:8]}: {a['market_count']} markets, "
+                f"sum={a['price_sum']:.2f}, deviation={a['deviation']:+.4f}"
+            )
+
+
+@backtest.command("strategy")
+def show_strategy():
+    """Display current strategy configuration."""
+    from polymarket_agent.backtest.strategy import load_strategy_config
+
+    config = load_strategy_config()
+
+    console.print(f"\n[bold]Strategy Configuration v{config.get('version', '?')}[/]")
+    console.print(f"  Updated: {config.get('updated_at', 'unknown')}")
+    console.print(f"  By: {config.get('updated_by', 'unknown')}")
+
+    ms = config.get("market_selection", {})
+    console.print(f"\n[bold]Market Selection[/]")
+    console.print(f"  Target categories: {ms.get('target_categories') or 'all'}")
+    console.print(f"  Avoid categories: {ms.get('avoid_categories') or 'none'}")
+    console.print(f"  Volume range: {ms.get('volume_range', {})}")
+
+    et = config.get("edge_thresholds", {})
+    console.print(f"\n[bold]Edge Thresholds[/]")
+    console.print(f"  Default: {et.get('default', '?')}")
+    console.print(f"  Floor: {et.get('floor', '?')}, Ceiling: {et.get('ceiling', '?')}")
+    overrides = et.get("category_overrides", {})
+    if overrides:
+        for cat, val in overrides.items():
+            console.print(f"  Override: {cat} → {val}")
+
+    ra = config.get("regime_awareness", {})
+    console.print(f"\n[bold]Regime Awareness[/]")
+    console.print(f"  Current: {ra.get('current_regime', '?')}")
+    console.print(f"  Efficiency trend: {ra.get('efficiency_trend', '?')}")
+    console.print(f"  Agent confidence: {ra.get('agent_confidence', '?')}")
+
+    insights = config.get("insights", [])
+    if insights:
+        console.print(f"\n[bold]Recent Insights ({len(insights)} total)[/]")
+        for ins in insights[-5:]:
+            console.print(
+                f"  [{ins.get('date', '?')}] {ins.get('finding', '')} "
+                f"(confidence: {ins.get('confidence', '?')})"
+            )
+
+
 if __name__ == "__main__":
     cli()
