@@ -2,7 +2,7 @@
 
 import logging
 import threading
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -11,13 +11,40 @@ from apscheduler.triggers.interval import IntervalTrigger
 from polymarket_agent.analyst.estimator import ProbabilityEstimator
 from polymarket_agent.config import settings
 from polymarket_agent.market.scanner import MarketScanner
+from polymarket_agent.market.storage import (
+    get_open_position_market_ids,
+    get_unresolved_prediction_market_ids,
+)
 from polymarket_agent.models import Market
 from polymarket_agent.risk.manager import RiskManager
-from polymarket_agent.trading.calibration import export_calibration_for_llm, record_prediction
+from polymarket_agent.storage.snapshots import (
+    cleanup_old_snapshots,
+    get_latest_prices,
+    insert_price_snapshots,
+    upsert_daily_pnl,
+)
+from polymarket_agent.trading.calibration import (
+    export_calibration_for_llm,
+    get_prediction_for_position,
+    record_prediction,
+    update_prediction_outcome,
+)
 from polymarket_agent.trading.edge import build_recommendation
 from polymarket_agent.trading.paper import PaperTrader
 
 logger = logging.getLogger(__name__)
+
+
+def compute_remaining_edge(side: str, original_estimate: float, current_price: float) -> float:
+    """Compute remaining edge for a position.
+
+    For YES positions: original_estimate - current_price
+    For NO positions: current_price - original_estimate (because we bet against YES)
+    """
+    if side == "YES":
+        return original_estimate - current_price
+    else:
+        return current_price - original_estimate
 
 
 class AgentScheduler:
@@ -94,7 +121,7 @@ class AgentScheduler:
         logger.info("Scheduler stopped")
 
     def _scan_job(self):
-        """Periodic scan for new markets and events."""
+        """Periodic scan for new markets, price snapshots, and resolution detection."""
         if not self._running or self.risk.is_kill_switch_active():
             return
 
@@ -106,6 +133,70 @@ class AgentScheduler:
         if events:
             logger.info("Detected %d events", len(events))
         logger.info("Scan complete: %d candidates", len(candidates))
+
+        # Record price snapshots for markets with open positions or predictions
+        tracked_ids = get_open_position_market_ids() | get_unresolved_prediction_market_ids()
+        if tracked_ids:
+            all_markets = self.scanner.last_fetched_markets or []
+            tracked_markets = [m for m in all_markets if m.id in tracked_ids]
+            if tracked_markets:
+                count = insert_price_snapshots(tracked_markets)
+                logger.debug("Recorded %d price snapshots", count)
+
+        # Detect resolutions
+        self._detect_resolutions()
+
+    def _detect_resolutions(self):
+        """Check for resolved markets with open positions or unresolved predictions."""
+        from polymarket_agent.storage.database import get_db
+
+        with get_db() as conn:
+            # Find resolved markets that have open positions
+            pos_rows = conn.execute(
+                """SELECT DISTINCT m.id, m.resolution_outcome, m.question
+                FROM markets m
+                JOIN positions p ON p.market_id = m.id
+                WHERE m.resolved = 1 AND p.status = 'open'"""
+            ).fetchall()
+
+            # Find resolved markets that have unresolved predictions
+            pred_rows = conn.execute(
+                """SELECT DISTINCT m.id, m.resolution_outcome, m.question
+                FROM markets m
+                JOIN predictions pr ON pr.market_id = m.id
+                WHERE m.resolved = 1 AND pr.outcome IS NULL"""
+            ).fetchall()
+
+        # Combine unique resolved market IDs
+        resolved = {}
+        for row in pos_rows + pred_rows:
+            if row["id"] not in resolved and row["resolution_outcome"]:
+                resolved[row["id"]] = (row["resolution_outcome"], row["question"])
+
+        if not resolved:
+            return
+
+        logger.info("Detected %d resolved markets with open items", len(resolved))
+
+        for market_id, (outcome_str, question) in resolved.items():
+            # Map outcome string to numeric
+            outcome_value = 1.0 if outcome_str.upper() == "YES" else 0.0
+
+            # Update prediction outcomes
+            updated = update_prediction_outcome(market_id, outcome_value)
+            if updated:
+                logger.info(
+                    "Updated %d predictions for resolved market %s: %s",
+                    updated, market_id[:8], question[:40],
+                )
+
+            # Resolve paper positions
+            closed = self.paper.resolve_positions(market_id, outcome_str.upper())
+            if closed:
+                logger.info(
+                    "Closed %d positions on resolved market %s",
+                    len(closed), market_id[:8],
+                )
 
     def _analysis_job(self):
         """Analyze candidate markets and generate trade recommendations."""
@@ -119,18 +210,27 @@ class AgentScheduler:
             logger.info("No candidates for analysis")
             return
 
-        logger.info("Running analysis on %d candidates...", len(candidates))
+        cap = settings.max_analyses_per_cycle
+        if cap > 0:
+            logger.info("Running analysis on %d candidates (cap: %d)...", len(candidates), cap)
+        else:
+            logger.info("Running analysis on %d candidates...", len(candidates))
         calibration_text = export_calibration_for_llm()
         bankroll = self.paper.get_cash_balance()
+        analyzed = 0
 
         for market in candidates:
             if not self._running:
+                break
+            if cap > 0 and analyzed >= cap:
+                logger.info("Analysis cap reached (%d), deferring remaining candidates", cap)
                 break
 
             # Screen first
             worth, reasoning = self.estimator.screen(market)
             if not worth:
                 continue
+            analyzed += 1
 
             # Full estimation
             try:
@@ -174,7 +274,7 @@ class AgentScheduler:
         logger.info("Analysis complete. LLM cost this session: $%.4f", usage["estimated_cost"])
 
     def _reevaluation_job(self):
-        """Re-evaluate open positions."""
+        """Re-evaluate open positions with tiered decision framework."""
         if not self._running:
             return
 
@@ -183,26 +283,160 @@ class AgentScheduler:
             return
 
         logger.info("Re-evaluating %d open positions...", summary.open_positions)
-        # For now, just log status. Full re-evaluation with exit signals
-        # would require re-running analysis on each position's market.
+
+        # Get latest prices for all position markets
+        position_market_ids = [p.market_id for p in summary.positions]
+        latest_prices = get_latest_prices(position_market_ids)
+
+        reanalyze_queue: list[tuple] = []  # (position, original_estimate, current_price)
+        reanalyses_done = 0
+        exits = 0
+        holds = 0
+
         for pos in summary.positions:
-            logger.info(
-                "Position: %s %s %.2f shares @ $%.4f",
-                pos.side.value,
-                pos.market_id[:8],
-                pos.size,
-                pos.entry_price,
-            )
+            current_price = latest_prices.get(pos.market_id)
+            if current_price is None:
+                # No snapshot available — use entry price as fallback
+                logger.debug("No price snapshot for %s, skipping", pos.market_id[:8])
+                holds += 1
+                continue
+
+            original_estimate = get_prediction_for_position(pos.market_id)
+            if original_estimate is None:
+                logger.debug("No prediction found for %s, skipping", pos.market_id[:8])
+                holds += 1
+                continue
+
+            edge = compute_remaining_edge(pos.side.value, original_estimate, current_price)
+
+            # Tier 1: Mechanical decision
+            if edge < settings.reeval_edge_exit_threshold:
+                # Edge reversed — exit immediately
+                self.paper.exit_position(pos.id, current_price, reason="edge reversed")
+                exits += 1
+            elif edge >= settings.min_edge_threshold:
+                # Edge still healthy — hold
+                logger.debug(
+                    "HOLD %s %s: edge=%.3f (estimate=%.3f, price=%.3f)",
+                    pos.side.value, pos.market_id[:8], edge, original_estimate, current_price,
+                )
+                holds += 1
+            else:
+                # Ambiguous zone or stale — queue for re-analysis
+                days_held = (datetime.utcnow() - pos.entry_timestamp).days
+                if edge < settings.reeval_reanalysis_threshold or days_held >= settings.reeval_staleness_days:
+                    reanalyze_queue.append((pos, original_estimate, current_price))
+                else:
+                    holds += 1
+
+        # Tier 2: LLM re-analysis for ambiguous positions
+        cap = settings.max_reanalyses_per_cycle
+        for pos, original_estimate, current_price in reanalyze_queue:
+            if not self._running:
+                break
+            if reanalyses_done >= cap:
+                logger.info("Re-analysis cap reached (%d), deferring %d positions",
+                           cap, len(reanalyze_queue) - reanalyses_done)
+                holds += len(reanalyze_queue) - reanalyses_done
+                break
+
+            from polymarket_agent.market.storage import get_market
+            market = get_market(pos.market_id)
+            if not market:
+                holds += 1
+                continue
+
+            logger.info("Re-analyzing %s %s (edge=%.3f)...",
+                       pos.side.value, pos.market_id[:8],
+                       compute_remaining_edge(pos.side.value, original_estimate, current_price))
+
+            try:
+                calibration_text = export_calibration_for_llm()
+                new_estimate = self.estimator.estimate(market, calibration_text)
+                reanalyses_done += 1
+
+                new_edge = compute_remaining_edge(
+                    pos.side.value, new_estimate.final_estimate, current_price
+                )
+
+                if new_edge < settings.min_edge_threshold:
+                    # Re-analysis confirms edge is gone
+                    self.paper.exit_position(
+                        pos.id, current_price,
+                        reason=f"re-analysis: new_est={new_estimate.final_estimate:.3f}, "
+                               f"old_est={original_estimate:.3f}, edge={new_edge:.3f}",
+                    )
+                    exits += 1
+                else:
+                    logger.info(
+                        "HOLD after re-analysis %s: new_edge=%.3f (new_est=%.3f)",
+                        pos.market_id[:8], new_edge, new_estimate.final_estimate,
+                    )
+                    holds += 1
+            except Exception as e:
+                logger.error("Re-analysis failed for %s: %s", pos.market_id[:8], e)
+                holds += 1
+
+        logger.info(
+            "Re-evaluation complete: %d exits, %d holds, %d re-analyses",
+            exits, holds, reanalyses_done,
+        )
 
     def _daily_report_job(self):
-        """Generate daily report."""
-        summary = self.paper.get_portfolio_summary()
+        """Generate daily report, persist P&L, and clean up old snapshots."""
+        # Get latest prices for mark-to-market
+        open_market_ids = list(self.paper.get_open_position_market_ids())
+        latest_prices = get_latest_prices(open_market_ids) if open_market_ids else {}
+
+        summary = self.paper.get_portfolio_summary(current_prices=latest_prices)
         usage = self.estimator.llm.get_usage_summary()
+
+        # Compute daily P&L
+        today = date.today().isoformat()
+        from polymarket_agent.storage.database import get_db
+        with get_db() as conn:
+            # Realized P&L from positions closed today
+            row = conn.execute(
+                """SELECT COALESCE(SUM(realized_pnl), 0) as today_realized,
+                          COUNT(*) as trade_count
+                FROM positions
+                WHERE status = 'closed' AND exit_timestamp >= ?""",
+                (today,),
+            ).fetchone()
+            today_realized = row["today_realized"]
+            trade_count = row["trade_count"]
+
+        unrealized = summary.unrealized_pnl
+        total_pnl = today_realized + unrealized
+
+        # Persist daily P&L
+        upsert_daily_pnl(
+            date=today,
+            realized_pnl=today_realized,
+            unrealized_pnl=unrealized,
+            total_pnl=total_pnl,
+            portfolio_value=summary.total_portfolio_value,
+            trade_count=trade_count,
+        )
+
+        # Clean up old snapshots
+        deleted = cleanup_old_snapshots(settings.snapshot_retention_days)
+
+        # Calibration stats
+        from polymarket_agent.trading.calibration import compute_calibration
+        cal = compute_calibration()
 
         logger.info("=== DAILY REPORT ===")
         logger.info("Portfolio: $%.2f (cash: $%.2f)", summary.total_portfolio_value, summary.cash_balance)
         logger.info("Positions: %d open", summary.open_positions)
-        logger.info("P&L: realized=$%.2f, unrealized=$%.2f", summary.realized_pnl, summary.unrealized_pnl)
-        logger.info("Return: %+.2f%%", summary.total_return_pct)
+        logger.info("P&L today: realized=$%.2f, unrealized=$%.2f, total=$%.2f",
+                    today_realized, unrealized, total_pnl)
+        logger.info("P&L all-time: realized=$%.2f, return=%+.2f%%",
+                    summary.realized_pnl, summary.total_return_pct)
+        logger.info("Calibration: %d total predictions, %d resolved%s",
+                    cal.total_predictions, cal.resolved_predictions,
+                    f", Brier={cal.brier_score:.4f}" if cal.brier_score is not None else "")
         logger.info("LLM usage: %d calls, ~$%.4f total", usage["calls"], usage["estimated_cost"])
+        if deleted:
+            logger.info("Snapshot cleanup: %d old records removed", deleted)
         logger.info("=== END REPORT ===")

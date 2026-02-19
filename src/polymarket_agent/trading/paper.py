@@ -147,6 +147,15 @@ class PaperTrader:
                         (payout, now.isoformat()),
                     )
 
+                # Record sell trade for audit trail
+                exit_price = 1.0 if side == outcome else 0.0
+                conn.execute(
+                    """INSERT INTO trades
+                    (market_id, position_id, side, action, size, price, timestamp, mode, status)
+                    VALUES (?, ?, ?, 'sell', ?, ?, ?, 'paper', 'filled')""",
+                    (market_id, row["id"], side, size, exit_price, now.isoformat()),
+                )
+
                 resolved.append(
                     Position(
                         id=row["id"],
@@ -173,6 +182,89 @@ class PaperTrader:
                 )
 
         return resolved
+
+    def exit_position(self, position_id: int, exit_price: float, reason: str = "") -> Position | None:
+        """Close a position at a given market price (for re-evaluation exits).
+
+        Returns the closed Position or None if not found/already closed.
+        """
+        now = datetime.utcnow()
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE id = ? AND status = 'open'",
+                (position_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            side = row["side"]
+            size = row["size"]
+            entry_price = row["entry_price"]
+
+            # P&L for YES: (exit_price - entry_price) * size
+            # P&L for NO: ((1 - exit_price) - (1 - entry_price)) * size = (entry_price - exit_price) * size
+            if side == "YES":
+                pnl = (exit_price - entry_price) * size
+                cash_credit = exit_price * size
+            else:
+                no_exit_price = 1.0 - exit_price
+                pnl = (no_exit_price - entry_price) * size
+                cash_credit = no_exit_price * size
+
+            # Close position
+            conn.execute(
+                """UPDATE positions SET
+                exit_price = ?, exit_timestamp = ?, realized_pnl = ?, status = 'closed'
+                WHERE id = ?""",
+                (exit_price, now.isoformat(), pnl, position_id),
+            )
+
+            # Credit cash
+            conn.execute(
+                "UPDATE portfolio SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                (cash_credit, now.isoformat()),
+            )
+
+            # Record sell trade
+            conn.execute(
+                """INSERT INTO trades
+                (market_id, position_id, side, action, size, price, timestamp, mode, status)
+                VALUES (?, ?, ?, 'sell', ?, ?, ?, 'paper', 'filled')""",
+                (row["market_id"], position_id, side, size, exit_price, now.isoformat()),
+            )
+
+        logger.info(
+            "Exit position %d: %s %s @ $%.4f (P&L: $%.2f) %s",
+            position_id,
+            side,
+            row["market_id"][:8],
+            exit_price,
+            pnl,
+            reason,
+        )
+
+        return Position(
+            id=position_id,
+            market_id=row["market_id"],
+            side=Side(side),
+            size=size,
+            entry_price=entry_price,
+            entry_timestamp=datetime.fromisoformat(row["entry_timestamp"]),
+            exit_price=exit_price,
+            exit_timestamp=now,
+            realized_pnl=pnl,
+            status=PositionStatus.CLOSED,
+            mode=TradingMode.PAPER,
+        )
+
+    def get_open_position_market_ids(self) -> set[str]:
+        """Get market IDs with open positions."""
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT market_id FROM positions WHERE status = 'open' AND mode = 'paper'"
+            ).fetchall()
+        return {r["market_id"] for r in rows}
 
     def get_portfolio_summary(self, current_prices: dict[str, float] | None = None) -> PortfolioSummary:
         """Get current portfolio summary."""

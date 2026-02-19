@@ -24,6 +24,7 @@ class MarketScanner:
         self.clob = clob_client or ClobClient()
         self.filter = market_filter or MarketFilter()
         self.events = event_detector or EventDetector()
+        self.last_fetched_markets: list[Market] = []
 
     def scan(self) -> tuple[list[Market], list[MarketEvent]]:
         """Run a full scan cycle: fetch, store, filter, detect events.
@@ -42,7 +43,8 @@ class MarketScanner:
             logger.warning("No markets returned from Gamma API")
             return [], []
 
-        # Store in database
+        # Store in database and cache for snapshot use
+        self.last_fetched_markets = all_markets
         upsert_markets(all_markets)
 
         # Detect events

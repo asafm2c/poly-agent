@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     analysis_interval: int = 3600  # 1 hour
     reevaluation_interval: int = 14400  # 4 hours
     daily_report_hour: int = 18  # UTC
+    max_analyses_per_cycle: int = 5  # Cap LLM calls per analysis cycle (0 = unlimited)
+
+    # --- Re-evaluation ---
+    reeval_edge_exit_threshold: float = 0.0  # Exit without re-analysis below this edge
+    reeval_reanalysis_threshold: float = 0.05  # Trigger LLM re-analysis below this edge
+    reeval_staleness_days: int = 7  # Re-analyze positions held longer than this
+    max_reanalyses_per_cycle: int = 3  # Cap LLM calls per re-evaluation cycle
+
+    # --- Price Snapshots ---
+    snapshot_retention_days: int = 30
 
     # --- Order Management ---
     order_timeout_seconds: int = 3600  # 1 hour

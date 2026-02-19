@@ -103,6 +103,24 @@ def get_markets_by_category(category: str) -> list[Market]:
         return [_row_to_market(row) for row in rows]
 
 
+def get_open_position_market_ids() -> set[str]:
+    """Get market IDs that have open positions."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT market_id FROM positions WHERE status = 'open'"
+        ).fetchall()
+    return {r["market_id"] for r in rows}
+
+
+def get_unresolved_prediction_market_ids() -> set[str]:
+    """Get market IDs that have predictions with no outcome recorded."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT market_id FROM predictions WHERE outcome IS NULL"
+        ).fetchall()
+    return {r["market_id"] for r in rows}
+
+
 def _row_to_market(row) -> Market:
     return Market(
         id=row["id"],

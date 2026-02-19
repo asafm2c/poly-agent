@@ -16,6 +16,20 @@ logger = logging.getLogger(__name__)
 BUCKETS = [(i / 10, (i + 1) / 10) for i in range(10)]  # 0.0-0.1, 0.1-0.2, ..., 0.9-1.0
 
 
+def get_prediction_for_position(market_id: str) -> float | None:
+    """Get the most recent prediction's final_estimate for a market.
+
+    Returns the estimate value, or None if no prediction exists.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT final_estimate FROM predictions
+            WHERE market_id = ? ORDER BY timestamp DESC LIMIT 1""",
+            (market_id,),
+        ).fetchone()
+    return row["final_estimate"] if row else None
+
+
 def record_prediction(
     estimate: ProbabilityEstimate,
     market_price: float,

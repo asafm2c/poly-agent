@@ -378,6 +378,12 @@ def config():
     table.add_row("", "")
     table.add_row("Scan Interval", f"{settings.scan_interval // 60} min")
     table.add_row("Analysis Interval", f"{settings.analysis_interval // 60} min")
+    table.add_row("Max Analyses/Cycle", f"{settings.max_analyses_per_cycle}" if settings.max_analyses_per_cycle > 0 else "Unlimited")
+    table.add_row("Re-eval Exit Threshold", f"{settings.reeval_edge_exit_threshold:.2f}")
+    table.add_row("Re-eval Reanalysis Threshold", f"{settings.reeval_reanalysis_threshold:.2f}")
+    table.add_row("Re-eval Staleness", f"{settings.reeval_staleness_days} days")
+    table.add_row("Max Re-analyses/Cycle", f"{settings.max_reanalyses_per_cycle}")
+    table.add_row("Snapshot Retention", f"{settings.snapshot_retention_days} days")
     table.add_row("DB Path", str(settings.db_path))
 
     # Kill switch status
