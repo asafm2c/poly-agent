@@ -6,6 +6,7 @@ import time
 
 from anthropic import Anthropic, APIError, RateLimitError
 
+from polymarket_agent import metrics
 from polymarket_agent.config import settings
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,9 @@ class LLMClient:
                 if system:
                     kwargs["system"] = system
 
+                t0 = time.monotonic()
                 response = self._client.messages.create(**kwargs)
+                latency_ms = int((time.monotonic() - t0) * 1000)
 
                 # Track usage
                 usage = response.usage
@@ -71,9 +74,16 @@ class LLMClient:
                     usage.output_tokens,
                     cost,
                 )
+                metrics.record(
+                    "llm_call", model=model,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost=round(cost, 6), latency_ms=latency_ms,
+                )
                 return text
 
             except RateLimitError:
+                metrics.record("api_error", service="anthropic", error="rate_limit", model=model)
                 if attempt < retries:
                     wait = 2 ** (attempt + 1)
                     logger.warning("Rate limited, waiting %ds before retry", wait)
@@ -81,6 +91,7 @@ class LLMClient:
                 else:
                     raise
             except APIError as e:
+                metrics.record("api_error", service="anthropic", error=str(e.status_code), model=model)
                 if attempt < retries and e.status_code and e.status_code >= 500:
                     wait = 2 ** (attempt + 1)
                     logger.warning("API error %s, retrying in %ds", e.status_code, wait)

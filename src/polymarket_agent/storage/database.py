@@ -4,7 +4,7 @@ from pathlib import Path
 
 from polymarket_agent.config import settings
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATIONS = [
     # Version 1: Initial schema
@@ -147,6 +147,18 @@ MIGRATIONS = [
 
     CREATE INDEX IF NOT EXISTS idx_snapshots_market_time
         ON price_snapshots(market_id, timestamp);
+    """,
+    # Version 3: Operational metrics
+    """
+    CREATE TABLE IF NOT EXISTS metric_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        data TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_metric_events_type_time
+        ON metric_events(event_type, timestamp);
     """,
 ]
 

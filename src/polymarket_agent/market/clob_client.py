@@ -1,9 +1,11 @@
 """CLOB API client for prices, order books, and price history."""
 
 import logging
+import time
 
 import httpx
 
+from polymarket_agent import metrics
 from polymarket_agent.config import settings
 from polymarket_agent.models import OrderBookSignals
 
@@ -21,32 +23,44 @@ class ClobClient:
     def get_price(self, token_id: str) -> float | None:
         """Get current price for a token."""
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/price", params={"token_id": token_id})
             resp.raise_for_status()
+            metrics.record("api_call", service="clob", endpoint="/price", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             data = resp.json()
             return float(data.get("price", 0))
         except (httpx.HTTPError, ValueError, KeyError) as e:
+            metrics.record("api_call", service="clob", endpoint="/price", status="error")
+            metrics.record("api_error", service="clob", endpoint="/price", error=str(e))
             logger.error("CLOB price error for %s: %s", token_id, e)
             return None
 
     def get_midpoint(self, token_id: str) -> float | None:
         """Get midpoint price for a token."""
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/midpoint", params={"token_id": token_id})
             resp.raise_for_status()
+            metrics.record("api_call", service="clob", endpoint="/midpoint", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             data = resp.json()
             return float(data.get("mid", 0))
         except (httpx.HTTPError, ValueError, KeyError) as e:
+            metrics.record("api_call", service="clob", endpoint="/midpoint", status="error")
+            metrics.record("api_error", service="clob", endpoint="/midpoint", error=str(e))
             logger.error("CLOB midpoint error for %s: %s", token_id, e)
             return None
 
     def get_order_book(self, token_id: str) -> dict | None:
         """Get order book for a token. Returns {bids: [...], asks: [...]}."""
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/book", params={"token_id": token_id})
             resp.raise_for_status()
+            metrics.record("api_call", service="clob", endpoint="/book", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             return resp.json()
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="clob", endpoint="/book", status="error")
+            metrics.record("api_error", service="clob", endpoint="/book", error=str(e))
             logger.error("CLOB book error for %s: %s", token_id, e)
             return None
 
@@ -69,10 +83,14 @@ class ClobClient:
             "fidelity": fidelity,
         }
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/prices-history", params=params)
             resp.raise_for_status()
+            metrics.record("api_call", service="clob", endpoint="/prices-history", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             return resp.json().get("history", [])
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="clob", endpoint="/prices-history", status="error")
+            metrics.record("api_error", service="clob", endpoint="/prices-history", error=str(e))
             logger.error("CLOB history error for %s: %s", token_id, e)
             return None
 

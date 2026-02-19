@@ -1,10 +1,12 @@
 """Gamma API client for market discovery and metadata."""
 
 import logging
+import time
 from datetime import datetime
 
 import httpx
 
+from polymarket_agent import metrics
 from polymarket_agent.config import settings
 from polymarket_agent.models import Market
 
@@ -48,10 +50,14 @@ class GammaClient:
             params["liquidity_num_min"] = min_liquidity
 
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/markets", params=params)
             resp.raise_for_status()
+            metrics.record("api_call", service="gamma", endpoint="/markets", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             data = resp.json()
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="gamma", endpoint="/markets", status="error")
+            metrics.record("api_error", service="gamma", endpoint="/markets", error=str(e))
             logger.error("Gamma API error fetching markets: %s", e)
             return []
 
@@ -101,10 +107,14 @@ class GammaClient:
     def fetch_market_by_id(self, market_id: str) -> Market | None:
         """Fetch a single market by its ID."""
         try:
+            t0 = time.monotonic()
             resp = self._client.get(f"/markets/{market_id}")
             resp.raise_for_status()
+            metrics.record("api_call", service="gamma", endpoint="/markets/{id}", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             return _parse_market(resp.json())
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="gamma", endpoint="/markets/{id}", status="error")
+            metrics.record("api_error", service="gamma", endpoint="/markets/{id}", error=str(e))
             logger.error("Gamma API error fetching market %s: %s", market_id, e)
             return None
 
@@ -112,10 +122,14 @@ class GammaClient:
         """Fetch events (groups of related markets)."""
         params = {"limit": limit, "offset": offset, "active": "true"}
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/events", params=params)
             resp.raise_for_status()
+            metrics.record("api_call", service="gamma", endpoint="/events", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             return resp.json()
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="gamma", endpoint="/events", status="error")
+            metrics.record("api_error", service="gamma", endpoint="/events", error=str(e))
             logger.error("Gamma API error fetching events: %s", e)
             return []
 
@@ -129,10 +143,14 @@ class GammaClient:
             "ascending": "false",
         }
         try:
+            t0 = time.monotonic()
             resp = self._client.get("/comments", params=params)
             resp.raise_for_status()
+            metrics.record("api_call", service="gamma", endpoint="/comments", status=resp.status_code, latency_ms=int((time.monotonic() - t0) * 1000))
             return resp.json()
         except httpx.HTTPError as e:
+            metrics.record("api_call", service="gamma", endpoint="/comments", status="error")
+            metrics.record("api_error", service="gamma", endpoint="/comments", error=str(e))
             logger.debug("Comments unavailable for %s: %s", market_id, e)
             return []
 

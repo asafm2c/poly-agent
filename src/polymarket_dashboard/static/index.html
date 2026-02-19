@@ -113,6 +113,7 @@
       <button data-tab="positions">Positions</button>
       <button data-tab="calibration">Calibration</button>
       <button data-tab="operations">Operations</button>
+      <button data-tab="costs">Costs &amp; Ops</button>
     </div>
     <span id="kill-switch-badge" class="status-badge status-ok">TRADING ACTIVE</span>
     <span class="refresh-info" id="refresh-info">Loading...</span>
@@ -179,6 +180,35 @@
       <div class="chart-container">
         <div class="chart-title">Daily Trade Count (Last 30 Days)</div>
         <div id="trade-count-chart" style="height:250px;"></div>
+      </div>
+    </div>
+
+    <!-- COSTS & OPS TAB -->
+    <div id="tab-costs" class="tab-content">
+      <div class="kpi-grid" id="costs-kpis"></div>
+      <div class="grid-2">
+        <div class="chart-container">
+          <div class="chart-title">LLM Token Usage &amp; Cost</div>
+          <div id="llm-tokens-chart" style="height:300px;"></div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-title">API Calls by Service</div>
+          <div id="api-calls-chart" style="height:300px;"></div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="chart-container">
+          <div class="chart-title">Cost by Model</div>
+          <div id="cost-donut-chart" style="height:280px;"></div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-title">Error Rate (Daily)</div>
+          <div id="error-rate-chart" style="height:280px;"></div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Recent Events</div>
+        <div id="events-table"></div>
       </div>
     </div>
   </main>
@@ -592,6 +622,174 @@
       }
     }
 
+    // --- Costs & Ops ---
+    async function refreshCosts() {
+      const [summary, ts, breakdown, storage, recent] = await Promise.all([
+        api('/metrics/summary?days=1'),
+        api('/metrics/timeseries?days=14'),
+        api('/metrics/cost-breakdown?days=7'),
+        api('/metrics/storage'),
+        api('/metrics/recent?limit=30'),
+      ]);
+
+      // KPIs
+      const llmCost = summary ? summary.llm.cost : 0;
+      const llmCalls = summary ? summary.llm.calls : 0;
+      const apiTotal = summary ? summary.api_calls.total : 0;
+      const dbSize = storage ? storage.db_size_mb + ' MB' : '-';
+      const dbRows = storage ? storage.tables.markets.toLocaleString() + ' markets' : '';
+
+      $('#costs-kpis').innerHTML = [
+        kpiCard('LLM Cost Today', '$' + llmCost.toFixed(4),
+          summary ? `${summary.llm.input_tokens.toLocaleString()} in / ${summary.llm.output_tokens.toLocaleString()} out tokens` : ''),
+        kpiCard('LLM Calls Today', llmCalls.toLocaleString(),
+          summary ? `${summary.errors} errors` : ''),
+        kpiCard('API Calls Today', apiTotal.toLocaleString(),
+          summary ? `G:${summary.api_calls.gamma} C:${summary.api_calls.clob} T:${summary.api_calls.tavily}` : ''),
+        kpiCard('DB Size', dbSize, dbRows),
+      ].join('');
+
+      // LLM Token Usage stacked area + cost overlay
+      if (ts && ts.days.length > 0) {
+        Plotly.react('llm-tokens-chart', [
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.llm_input_tokens),
+            type: 'scatter', mode: 'lines', fill: 'tozeroy',
+            fillcolor: 'rgba(59,130,246,0.2)', line: { color: '#3b82f6', width: 1 },
+            name: 'Input Tokens', yaxis: 'y',
+          },
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.llm_output_tokens),
+            type: 'scatter', mode: 'lines', fill: 'tonexty',
+            fillcolor: 'rgba(168,85,247,0.2)', line: { color: '#a855f7', width: 1 },
+            name: 'Output Tokens', yaxis: 'y',
+          },
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.llm_cost),
+            type: 'scatter', mode: 'lines+markers',
+            line: { color: '#f59e0b', width: 2 },
+            marker: { size: 5, color: '#f59e0b' },
+            name: 'Cost ($)', yaxis: 'y2',
+          }
+        ], {
+          ...PLOTLY_DARK,
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Tokens' },
+          yaxis2: { title: 'Cost ($)', overlaying: 'y', side: 'right', tickprefix: '$',
+            gridcolor: 'transparent', zerolinecolor: '#334155', font: { color: '#f59e0b' } },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+          showlegend: true, legend: { x: 0.02, y: 0.98, font: { size: 10 } },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#llm-tokens-chart').innerHTML = '<div class="empty-state">No LLM usage data yet. Metrics appear after the agent runs.</div>';
+      }
+
+      // API calls by service stacked bar
+      if (ts && ts.days.length > 0) {
+        Plotly.react('api-calls-chart', [
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.api_calls_gamma),
+            type: 'bar', name: 'Gamma', marker: { color: '#3b82f6' },
+          },
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.api_calls_clob),
+            type: 'bar', name: 'CLOB', marker: { color: '#22c55e' },
+          },
+          {
+            x: ts.days.map(d => d.date), y: ts.days.map(d => d.api_calls_tavily),
+            type: 'bar', name: 'Tavily', marker: { color: '#f59e0b' },
+          }
+        ], {
+          ...PLOTLY_DARK,
+          barmode: 'stack',
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Calls' },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+          showlegend: true, legend: { x: 0.02, y: 0.98, font: { size: 10 } },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#api-calls-chart').innerHTML = '<div class="empty-state">No API call data yet</div>';
+      }
+
+      // Cost breakdown donut
+      if (breakdown && breakdown.models.length > 0) {
+        const modelColors = { 'claude-haiku-4-5-20251001': '#22c55e', 'claude-sonnet-4-6': '#3b82f6' };
+        Plotly.react('cost-donut-chart', [{
+          values: breakdown.models.map(m => m.cost),
+          labels: breakdown.models.map(m => m.model.replace('claude-', '').split('-20')[0]),
+          type: 'pie', hole: 0.5,
+          marker: { colors: breakdown.models.map(m => modelColors[m.model] || '#94a3b8') },
+          textinfo: 'label+percent',
+          textfont: { size: 11, color: '#e2e8f0' },
+          hovertemplate: '%{label}<br>$%{value:.4f}<br>%{percent}<extra></extra>',
+        }], {
+          ...PLOTLY_DARK,
+          showlegend: false,
+          annotations: [{
+            text: '$' + breakdown.models.reduce((s, m) => s + m.cost, 0).toFixed(2),
+            showarrow: false, font: { size: 18, color: '#e2e8f0' },
+          }],
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#cost-donut-chart').innerHTML = '<div class="empty-state">No cost data yet</div>';
+      }
+
+      // Error rate line
+      if (ts && ts.days.length > 0) {
+        const totalPerDay = ts.days.map(d => d.api_calls_gamma + d.api_calls_clob + d.api_calls_tavily + d.llm_calls);
+        const errorRate = ts.days.map((d, i) => totalPerDay[i] > 0 ? (d.api_errors / totalPerDay[i]) * 100 : 0);
+        Plotly.react('error-rate-chart', [{
+          x: ts.days.map(d => d.date), y: errorRate,
+          type: 'scatter', mode: 'lines+markers',
+          line: { color: '#ef4444', width: 2 },
+          marker: { size: 5, color: '#ef4444' },
+          name: 'Error %',
+        }, {
+          x: ts.days.map(d => d.date), y: ts.days.map(d => d.api_errors),
+          type: 'bar', name: 'Errors',
+          marker: { color: 'rgba(239,68,68,0.3)' },
+          yaxis: 'y2',
+        }], {
+          ...PLOTLY_DARK,
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Error Rate %', ticksuffix: '%' },
+          yaxis2: { title: 'Error Count', overlaying: 'y', side: 'right',
+            gridcolor: 'transparent', zerolinecolor: '#334155' },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+          showlegend: true, legend: { x: 0.02, y: 0.98, font: { size: 10 } },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#error-rate-chart').innerHTML = '<div class="empty-state">No error data yet</div>';
+      }
+
+      // Recent events table
+      if (recent && recent.events.length > 0) {
+        const rows = recent.events.map(e => {
+          const d = e.data;
+          let detail = '';
+          if (e.event_type === 'llm_call') {
+            detail = `${d.model || '?'} — ${(d.input_tokens||0).toLocaleString()}in/${(d.output_tokens||0).toLocaleString()}out — $${(d.cost||0).toFixed(4)} — ${d.latency_ms||0}ms`;
+          } else if (e.event_type === 'api_call') {
+            detail = `${d.service} ${d.endpoint} — ${d.status} — ${d.latency_ms != null ? d.latency_ms + 'ms' : ''}`;
+          } else if (e.event_type === 'api_error') {
+            detail = `${d.service} ${d.endpoint || ''} — ${d.error || ''}`;
+          } else {
+            detail = JSON.stringify(d).substring(0, 80);
+          }
+          const typeColor = e.event_type === 'api_error' ? 'var(--red)' : e.event_type === 'llm_call' ? '#a855f7' : 'var(--muted)';
+          return `<tr>
+            <td style="font-size:0.7rem;white-space:nowrap">${new Date(e.timestamp).toLocaleTimeString()}</td>
+            <td style="color:${typeColor};font-weight:600;font-size:0.75rem">${e.event_type}</td>
+            <td style="font-size:0.75rem">${detail}</td>
+          </tr>`;
+        }).join('');
+        $('#events-table').innerHTML = `
+          <table class="data-table">
+            <thead><tr><th>Time</th><th>Type</th><th>Details</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      } else {
+        $('#events-table').innerHTML = '<div class="empty-state">No metric events recorded yet. Events appear after the agent starts running.</div>';
+      }
+    }
+
     // --- Refresh orchestration ---
     async function refresh() {
       try {
@@ -600,6 +798,7 @@
           case 'positions': await refreshPositions(); break;
           case 'calibration': await refreshCalibration(); break;
           case 'operations': await refreshOperations(); break;
+          case 'costs': await refreshCosts(); break;
         }
         $('#refresh-info').textContent = `Updated ${new Date().toLocaleTimeString()}`;
       } catch (err) {

@@ -503,8 +503,10 @@ class AgentScheduler:
             trade_count=trade_count,
         )
 
-        # Clean up old snapshots
+        # Clean up old snapshots and metrics
         deleted = cleanup_old_snapshots(settings.snapshot_retention_days)
+        from polymarket_agent.metrics import cleanup_old_metrics
+        metrics_deleted = cleanup_old_metrics(30)
 
         # Calibration stats
         from polymarket_agent.trading.calibration import compute_brier_comparison, compute_calibration
@@ -539,4 +541,6 @@ class AgentScheduler:
         logger.info("LLM usage: %d calls, ~$%.4f total", usage["calls"], usage["estimated_cost"])
         if deleted:
             logger.info("Snapshot cleanup: %d old records removed", deleted)
+        if metrics_deleted:
+            logger.info("Metrics cleanup: %d old events removed", metrics_deleted)
         logger.info("=== END REPORT ===")

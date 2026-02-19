@@ -15,11 +15,11 @@ The dashboard SHALL use a dark color scheme (dark background, light text) suitab
 - **THEN** the background is dark (#0f172a), text is light (#e2e8f0), and cards/charts have subtle borders on a slightly lighter background (#1e293b)
 
 ### Requirement: Four-tab navigation
-The dashboard SHALL display a tab bar with four tabs: Portfolio, Positions, Calibration, and Operations. Only the active tab's content SHALL be visible. The Portfolio tab SHALL be active by default.
+The dashboard SHALL display a tab bar with five tabs: Portfolio, Positions, Calibration, Operations, and Costs & Ops. Only the active tab's content SHALL be visible. The Portfolio tab SHALL be active by default.
 
 #### Scenario: Switch between tabs
-- **WHEN** the user clicks the "Calibration" tab
-- **THEN** the Calibration tab content is shown, all other tabs are hidden, and the Calibration tab button is visually highlighted
+- **WHEN** the user clicks the "Costs & Ops" tab
+- **THEN** the Costs & Ops tab content is shown, all other tabs are hidden, and the Costs & Ops tab button is visually highlighted
 
 #### Scenario: Initial load
 - **WHEN** the dashboard loads for the first time
@@ -32,9 +32,13 @@ The dashboard SHALL automatically refresh data every 30 seconds. Only the active
 - **WHEN** the Portfolio tab is active and 30 seconds elapse
 - **THEN** `/api/portfolio/summary` and `/api/portfolio/equity-curve` are fetched and charts are updated
 
+#### Scenario: Refresh on Costs & Ops tab
+- **WHEN** the Costs & Ops tab is active and 30 seconds elapse
+- **THEN** `/api/metrics/summary`, `/api/metrics/timeseries`, `/api/metrics/cost-breakdown`, `/api/metrics/storage`, and `/api/metrics/recent` are fetched and charts are updated
+
 #### Scenario: Tab switch triggers immediate refresh
-- **WHEN** the user switches to the Positions tab
-- **THEN** the Positions tab data is fetched immediately without waiting for the next refresh interval
+- **WHEN** the user switches to the Costs & Ops tab
+- **THEN** the Costs & Ops tab data is fetched immediately without waiting for the next refresh interval
 
 ### Requirement: Kill switch status indicator
 The dashboard SHALL display a status badge in the navigation bar showing whether trading is active (green badge "TRADING ACTIVE") or halted (red pulsing badge "KILL SWITCH ACTIVE").

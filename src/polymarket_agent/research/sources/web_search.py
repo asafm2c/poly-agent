@@ -1,9 +1,11 @@
 """Tavily web search integration."""
 
 import logging
+import time
 
 from tavily import TavilyClient
 
+from polymarket_agent import metrics
 from polymarket_agent.config import settings
 from polymarket_agent.models import SearchResult
 
@@ -26,12 +28,14 @@ class WebSearcher:
             return []
 
         try:
+            t0 = time.monotonic()
             response = self._client.search(
                 query=query,
                 max_results=max_results,
                 search_depth="advanced",
                 include_answer=False,
             )
+            metrics.record("api_call", service="tavily", endpoint="search", status=200, latency_ms=int((time.monotonic() - t0) * 1000))
             results = []
             for item in response.get("results", []):
                 results.append(
@@ -45,6 +49,8 @@ class WebSearcher:
             logger.info("Web search for '%s': %d results", query[:50], len(results))
             return results
         except Exception as e:
+            metrics.record("api_call", service="tavily", endpoint="search", status="error")
+            metrics.record("api_error", service="tavily", endpoint="search", error=str(e))
             logger.error("Tavily search error for '%s': %s", query[:50], e)
             return []
 

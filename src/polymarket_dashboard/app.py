@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from polymarket_dashboard.db import DashboardDB
-from polymarket_dashboard.routes import calibration, operations, portfolio, positions
+from polymarket_dashboard.routes import calibration, metrics, operations, portfolio, positions
 
 
 def create_app(db_path: Path | None = None) -> FastAPI:
@@ -22,6 +22,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     app.include_router(positions.router, prefix="/api/positions", tags=["positions"])
     app.include_router(calibration.router, prefix="/api/calibration", tags=["calibration"])
     app.include_router(operations.router, prefix="/api/operations", tags=["operations"])
+    app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static_dir, html=True))
