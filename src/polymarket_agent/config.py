@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     max_slippage: float = 0.02
     default_fee_rate: float = 0.0  # Polymarket taker fee rate (0.0 = free)
     default_fee_exponent: float = 1.0  # Fee formula exponent
+    min_edge_floor: float = 0.05  # Adaptive threshold: minimum possible edge requirement
+    max_edge_ceiling: float = 0.25  # Adaptive threshold: maximum possible edge requirement
+    adaptive_edge_reference_volume: float = 100_000.0  # Volume used as reference for scaling
 
     # --- Opportunity Scoring Weights ---
     opportunity_weight_price: float = 0.20

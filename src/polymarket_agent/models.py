@@ -100,6 +100,15 @@ class Trade(BaseModel):
     status: str = "filled"
 
 
+# --- Order Book ---
+
+
+class OrderBookSignals(BaseModel):
+    imbalance_ratio: float  # total_bid / (total_bid + total_ask), 0.5 = balanced
+    spread_width: float  # best_ask - best_bid
+    depth_at_price: float  # total liquidity within 5% of midpoint
+
+
 # --- Research ---
 
 
@@ -124,6 +133,7 @@ class ResearchDossier(BaseModel):
     related_markets: list[dict] = Field(default_factory=list)
     domain_data: dict | None = None
     price_history: list[dict] = Field(default_factory=list)
+    order_book_signals: OrderBookSignals | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     cached: bool = False
 
@@ -140,6 +150,7 @@ class ProbabilityEstimate(BaseModel):
     updated_estimate: float
     pass1_reasoning: str
     pass2_reasoning: str
+    pass25_reasoning: str | None = None
     pass3_reasoning: str | None = None
     key_evidence: list[str] = Field(default_factory=list)
     thesis: str

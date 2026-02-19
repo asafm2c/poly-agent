@@ -54,7 +54,7 @@ class AgentScheduler:
         self.mode = mode
         self.scanner = MarketScanner()
         self.clob = ClobClient()
-        self.estimator = ProbabilityEstimator()
+        self.estimator = ProbabilityEstimator(clob_client=self.clob)
         self.risk = RiskManager()
         self.paper = PaperTrader()
         self._scheduler = BlockingScheduler()
@@ -86,14 +86,15 @@ class AgentScheduler:
             coalesce=True,
         )
 
-        # Re-evaluation job
-        self._scheduler.add_job(
-            self._reevaluation_job,
-            IntervalTrigger(seconds=settings.reevaluation_interval),
-            id="reevaluation",
-            misfire_grace_time=120,
-            coalesce=True,
-        )
+        # Re-evaluation job (skip in predict mode — no positions to manage)
+        if self.mode != "predict":
+            self._scheduler.add_job(
+                self._reevaluation_job,
+                IntervalTrigger(seconds=settings.reevaluation_interval),
+                id="reevaluation",
+                misfire_grace_time=120,
+                coalesce=True,
+            )
 
         # Daily report
         self._scheduler.add_job(
@@ -139,17 +140,20 @@ class AgentScheduler:
             logger.info("Detected %d events", len(events))
         logger.info("Scan complete: %d candidates", len(candidates))
 
-        # Record price snapshots for markets with open positions or predictions
-        tracked_ids = get_open_position_market_ids() | get_unresolved_prediction_market_ids()
-        if tracked_ids:
-            all_markets = self.scanner.last_fetched_markets or []
-            tracked_markets = [m for m in all_markets if m.id in tracked_ids]
-            if tracked_markets:
-                count = insert_price_snapshots(tracked_markets)
-                logger.debug("Recorded %d price snapshots", count)
+        # Record price snapshots and detect resolutions (skip in predict mode)
+        if self.mode != "predict":
+            tracked_ids = get_open_position_market_ids() | get_unresolved_prediction_market_ids()
+            if tracked_ids:
+                all_markets = self.scanner.last_fetched_markets or []
+                tracked_markets = [m for m in all_markets if m.id in tracked_ids]
+                if tracked_markets:
+                    count = insert_price_snapshots(tracked_markets)
+                    logger.debug("Recorded %d price snapshots", count)
 
-        # Detect resolutions
-        self._detect_resolutions()
+            self._detect_resolutions()
+        else:
+            # In predict mode, still detect resolutions for calibration
+            self._detect_resolutions()
 
     def _detect_resolutions(self):
         """Check for resolved markets with open positions or unresolved predictions."""
@@ -207,6 +211,7 @@ class AgentScheduler:
         """Analyze candidate markets using opportunity-scored pipeline.
 
         Flow: screen all → score → sort by score → analyze top-N.
+        In predict mode: estimate and record predictions only, no trading.
         """
         if not self._running or self.risk.is_kill_switch_active():
             return
@@ -221,8 +226,8 @@ class AgentScheduler:
 
         cap = settings.max_analyses_per_cycle
         logger.info(
-            "Running analysis: %d candidates, screening all, analyzing top %d...",
-            len(candidates), cap if cap > 0 else len(candidates),
+            "Running analysis (%s): %d candidates, screening all, analyzing top %d...",
+            self.mode, len(candidates), cap if cap > 0 else len(candidates),
         )
 
         # Phase 1: Screen all candidates, collecting signals
@@ -258,11 +263,14 @@ class AgentScheduler:
 
         # Phase 3: Analyze top-N
         calibration_text = export_calibration_for_llm()
-        bankroll = self.paper.get_cash_balance()
 
-        # Compute actual portfolio exposure for Kelly sizing
-        portfolio_summary = self.paper.get_portfolio_summary()
-        current_exposure = portfolio_summary.total_position_value
+        # Only compute portfolio state when trading
+        bankroll = 0.0
+        current_exposure = 0.0
+        if self.mode != "predict":
+            bankroll = self.paper.get_cash_balance()
+            portfolio_summary = self.paper.get_portfolio_summary()
+            current_exposure = portfolio_summary.total_position_value
 
         analyzed = 0
         for market, score in scored:
@@ -273,18 +281,25 @@ class AgentScheduler:
                 break
             analyzed += 1
 
+            token_id = market.outcome_yes_token
+
             # Full estimation
             try:
-                estimate = self.estimator.estimate(market, calibration_text)
+                estimate = self.estimator.estimate(
+                    market, calibration_text, token_id=token_id,
+                )
             except Exception as e:
                 logger.error("Estimation failed for %s: %s", market.id[:8], e)
                 continue
 
-            # Record prediction
-            record_prediction(estimate, market.last_price_yes or 0.5, market.category)
+            # In predict mode: record prediction and move on, no trading
+            if self.mode == "predict":
+                record_prediction(
+                    estimate, market.last_price_yes or 0.5, market.category,
+                )
+                continue
 
             # Get CLOB midpoint for accurate pricing
-            token_id = market.outcome_yes_token
             midpoint = None
             if token_id:
                 midpoint = self.clob.get_midpoint(token_id)
@@ -294,13 +309,20 @@ class AgentScheduler:
             fee_exponent = settings.default_fee_exponent
 
             # Build recommendation with real exposure, midpoint, and fees
-            rec = build_recommendation(
+            rec, adj_edge, req_threshold = build_recommendation(
                 market, estimate, bankroll,
                 current_exposure=current_exposure,
                 clob_midpoint=midpoint,
                 fee_rate=fee_rate,
                 fee_exponent=fee_exponent,
             )
+
+            # Record prediction with edge/threshold data (before trade decision)
+            record_prediction(
+                estimate, market.last_price_yes or 0.5, market.category,
+                edge=adj_edge, threshold=req_threshold,
+            )
+
             if not rec:
                 continue
 
@@ -485,7 +507,7 @@ class AgentScheduler:
         deleted = cleanup_old_snapshots(settings.snapshot_retention_days)
 
         # Calibration stats
-        from polymarket_agent.trading.calibration import compute_calibration
+        from polymarket_agent.trading.calibration import compute_brier_comparison, compute_calibration
         cal = compute_calibration()
 
         logger.info("=== DAILY REPORT ===")
@@ -495,9 +517,25 @@ class AgentScheduler:
                     today_realized, unrealized, total_pnl)
         logger.info("P&L all-time: realized=$%.2f, return=%+.2f%%",
                     summary.realized_pnl, summary.total_return_pct)
-        logger.info("Calibration: %d total predictions, %d resolved%s",
+        logger.info("Predictions: %d total, %d resolved, %d unresolved",
                     cal.total_predictions, cal.resolved_predictions,
+                    cal.total_predictions - cal.resolved_predictions)
+        logger.info("Calibration: %d resolved%s",
+                    cal.resolved_predictions,
                     f", Brier={cal.brier_score:.4f}" if cal.brier_score is not None else "")
+
+        # Brier comparison: agent vs market
+        brier_cmp = compute_brier_comparison()
+        if brier_cmp:
+            diff = brier_cmp["difference"]
+            signal = "AGENT BETTER" if diff < 0 else "MARKET BETTER"
+            logger.info(
+                "Brier comparison (%d resolved): agent=%.4f, market=%.4f, diff=%+.4f (%s)",
+                brier_cmp["resolved_count"],
+                brier_cmp["agent_brier"], brier_cmp["market_brier"],
+                diff, signal,
+            )
+
         logger.info("LLM usage: %d calls, ~$%.4f total", usage["calls"], usage["estimated_cost"])
         if deleted:
             logger.info("Snapshot cleanup: %d old records removed", deleted)

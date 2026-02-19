@@ -34,6 +34,8 @@ def record_prediction(
     estimate: ProbabilityEstimate,
     market_price: float,
     category: str | None = None,
+    edge: float | None = None,
+    threshold: float | None = None,
 ) -> int:
     """Record a prediction in the database. Returns the prediction ID."""
     now = datetime.utcnow()
@@ -42,8 +44,9 @@ def record_prediction(
             """INSERT INTO predictions
             (market_id, timestamp, market_price, agent_estimate,
              confidence_low, confidence_high, base_rate, updated_estimate,
-             final_estimate, reasoning, thesis, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             final_estimate, reasoning, thesis, category,
+             edge_at_prediction, threshold_at_prediction)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 estimate.market_id,
                 now.isoformat(),
@@ -57,6 +60,8 @@ def record_prediction(
                 estimate.pass2_reasoning,
                 estimate.thesis,
                 category,
+                edge,
+                threshold,
             ),
         )
         return cursor.lastrowid
@@ -200,6 +205,32 @@ def export_calibration_for_llm(min_resolved: int = 20) -> str:
                 )
 
     return "\n".join(lines)
+
+
+def compute_brier_comparison(min_resolved: int = 20) -> dict | None:
+    """Compare agent Brier score against market-price-as-forecast baseline.
+
+    Returns dict with agent_brier, market_brier, difference, and count.
+    Returns None if fewer than min_resolved predictions have outcomes.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT agent_estimate, market_price, outcome FROM predictions WHERE outcome IS NOT NULL"
+        ).fetchall()
+
+    if len(rows) < min_resolved:
+        return None
+
+    n = len(rows)
+    agent_brier = sum((r["agent_estimate"] - r["outcome"]) ** 2 for r in rows) / n
+    market_brier = sum((r["market_price"] - r["outcome"]) ** 2 for r in rows) / n
+
+    return {
+        "agent_brier": round(agent_brier, 4),
+        "market_brier": round(market_brier, 4),
+        "difference": round(agent_brier - market_brier, 4),
+        "resolved_count": n,
+    }
 
 
 def _get_categories_with_data() -> list[str]:

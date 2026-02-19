@@ -5,6 +5,7 @@ import logging
 import httpx
 
 from polymarket_agent.config import settings
+from polymarket_agent.models import OrderBookSignals
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,46 @@ class ClobClient:
         except httpx.HTTPError as e:
             logger.error("CLOB history error for %s: %s", token_id, e)
             return None
+
+    def get_order_book_signals(self, token_id: str, midpoint: float | None = None) -> OrderBookSignals | None:
+        """Compute order book signals: imbalance ratio, spread width, depth at price."""
+        book = self.get_order_book(token_id)
+        if not book:
+            return None
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if not bids and not asks:
+            return None
+
+        # Bid/ask imbalance ratio
+        total_bid = sum(float(b.get("size", 0)) for b in bids)
+        total_ask = sum(float(a.get("size", 0)) for a in asks)
+        total = total_bid + total_ask
+        imbalance = total_bid / total if total > 0 else 0.5
+
+        # Spread width
+        best_bid = max((float(b.get("price", 0)) for b in bids), default=0.0)
+        best_ask = min((float(a.get("price", 0)) for a in asks), default=1.0)
+        spread = max(0.0, best_ask - best_bid)
+
+        # Depth at price: liquidity within 5% of midpoint
+        mid = midpoint or (best_bid + best_ask) / 2 if (best_bid > 0 or best_ask < 1) else 0.5
+        depth = 0.0
+        for b in bids:
+            p = float(b.get("price", 0))
+            if p >= mid - 0.05:
+                depth += float(b.get("size", 0))
+        for a in asks:
+            p = float(a.get("price", 0))
+            if p <= mid + 0.05:
+                depth += float(a.get("size", 0))
+
+        return OrderBookSignals(
+            imbalance_ratio=round(imbalance, 3),
+            spread_width=round(spread, 4),
+            depth_at_price=round(depth, 2),
+        )
 
     def get_order_book_depth(self, token_id: str, price: float, side: str = "buy") -> float:
         """Calculate available liquidity at a given price level.

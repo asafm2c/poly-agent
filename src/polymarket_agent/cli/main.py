@@ -312,11 +312,17 @@ def report():
 @cli.command()
 @click.option("--paper", "paper_mode", is_flag=True, default=True, help="Run in paper trading mode")
 @click.option("--live", "live_mode", is_flag=True, help="Run in live trading mode")
-def run(paper_mode: bool, live_mode: bool):
+@click.option("--predict", "predict_mode", is_flag=True, help="Run in prediction-only mode (no trading)")
+def run(paper_mode: bool, live_mode: bool, predict_mode: bool):
     """Start the automated agent loop."""
     from polymarket_agent.cli.scheduler import AgentScheduler
 
-    mode = "live" if live_mode else "paper"
+    if predict_mode:
+        mode = "predict"
+    elif live_mode:
+        mode = "live"
+    else:
+        mode = "paper"
     console.print(f"\n[bold]Starting agent in {mode} mode[/]")
     console.print("Press Ctrl+C to stop.\n")
 

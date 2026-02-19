@@ -82,8 +82,9 @@ class ResearchGatherer:
             if source:
                 domain_data = source.gather(market.question, market.description)
 
-        # CLOB price history
+        # CLOB price history and order book signals
         price_history: list[dict] = []
+        order_book_signals = None
         tid = token_id or market.outcome_yes_token
         if self.clob and tid:
             try:
@@ -92,6 +93,13 @@ class ResearchGatherer:
                     price_history = history
             except Exception as e:
                 logger.debug("Price history unavailable for %s: %s", market.id[:8], e)
+
+            try:
+                order_book_signals = self.clob.get_order_book_signals(
+                    tid, midpoint=market.last_price_yes,
+                )
+            except Exception as e:
+                logger.debug("Order book signals unavailable for %s: %s", market.id[:8], e)
 
         dossier = ResearchDossier(
             market_id=market.id,
@@ -107,6 +115,7 @@ class ResearchGatherer:
             related_markets=related,
             domain_data=domain_data,
             price_history=price_history,
+            order_book_signals=order_book_signals,
             created_at=datetime.utcnow(),
             cached=False,
         )
@@ -140,6 +149,22 @@ class ResearchGatherer:
                 else f"**Current market price:** YES={dossier.current_price_yes:.2f}"
             )
         parts.append("")
+
+        # Market microstructure (order book signals)
+        if dossier.order_book_signals:
+            obs = dossier.order_book_signals
+            parts.append("## Market Microstructure")
+            imb = obs.imbalance_ratio
+            if imb > 0.6:
+                imb_text = "bid-heavy (informed buyers accumulating)"
+            elif imb < 0.4:
+                imb_text = "ask-heavy (informed sellers distributing)"
+            else:
+                imb_text = "balanced"
+            parts.append(f"- Bid/ask imbalance: {imb:.2f} — {imb_text}")
+            parts.append(f"- Spread width: {obs.spread_width:.4f}")
+            parts.append(f"- Depth within 5% of mid: {obs.depth_at_price:.0f} shares")
+            parts.append("")
 
         # Price history summary
         if dossier.price_history:

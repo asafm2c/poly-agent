@@ -1,6 +1,7 @@
 """Edge computation and Kelly position sizing."""
 
 import logging
+import math
 
 from polymarket_agent.config import settings
 from polymarket_agent.models import (
@@ -11,6 +12,47 @@ from polymarket_agent.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def compute_required_edge(
+    market: Market,
+    confidence_width: float = 0.30,
+    spread_width: float = 0.0,
+    category_brier: float | None = None,
+) -> float:
+    """Compute per-market edge threshold based on market efficiency.
+
+    Scales by volume (higher volume = higher threshold), confidence width
+    (wider band = higher threshold), and calibration quality (better Brier
+    = lower threshold). Clamped to [min_edge_floor, max_edge_ceiling].
+    """
+    base = settings.min_edge_threshold  # 0.10 default
+
+    # Volume factor: scale up for high-volume (efficient) markets
+    vol = max(market.volume, 1.0)
+    ref = settings.adaptive_edge_reference_volume
+    if ref > 0 and vol > 0:
+        volume_factor = 1.0 + 0.3 * math.log10(vol) / math.log10(max(ref, 10.0))
+    else:
+        volume_factor = 1.0
+
+    # Confidence factor: wider band = more uncertain = need more edge
+    confidence_factor = 1.0 + confidence_width
+
+    # Calibration factor: good Brier score reduces threshold
+    cal_factor = 1.0
+    if category_brier is not None:
+        if category_brier < 0.25:
+            # Better than coin-flip: reduce threshold (down to 0.8x)
+            cal_factor = 0.8 + 0.8 * category_brier
+        elif category_brier > 0.25:
+            # Worse than coin-flip: increase threshold (up to 1.2x)
+            cal_factor = 1.0 + 0.4 * (category_brier - 0.25)
+
+    threshold = base * volume_factor * confidence_factor * cal_factor
+
+    # Clamp
+    return max(settings.min_edge_floor, min(settings.max_edge_ceiling, threshold))
 
 
 def compute_taker_fee(price: float, fee_rate: float, exponent: float = 1.0) -> float:
@@ -113,20 +155,30 @@ def build_recommendation(
     clob_midpoint: float | None = None,
     fee_rate: float = 0.0,
     fee_exponent: float = 1.0,
-) -> TradeRecommendation | None:
-    """Build a trade recommendation if edge exceeds threshold."""
+    spread_width: float = 0.0,
+    category_brier: float | None = None,
+) -> tuple[TradeRecommendation | None, float, float]:
+    """Build a trade recommendation if edge exceeds adaptive threshold.
+
+    Returns (recommendation_or_none, adjusted_edge, required_threshold).
+    """
     raw_edge, adjusted_edge, side = compute_edge(
         estimate, market, fee_rate=fee_rate, fee_exponent=fee_exponent,
     )
 
-    if adjusted_edge < settings.min_edge_threshold:
+    confidence_width = estimate.confidence_high - estimate.confidence_low
+    required_edge = compute_required_edge(
+        market, confidence_width, spread_width, category_brier,
+    )
+
+    if adjusted_edge < required_edge:
         logger.info(
-            "Market %s: edge %.3f below threshold %.3f, skipping",
+            "Market %s: edge %.3f below adaptive threshold %.3f, skipping",
             market.id[:8],
             adjusted_edge,
-            settings.min_edge_threshold,
+            required_edge,
         )
-        return None
+        return None, adjusted_edge, required_edge
 
     # Determine the price we're trading at — prefer CLOB midpoint over stale Gamma price
     if clob_midpoint is not None:
@@ -149,9 +201,9 @@ def build_recommendation(
     )
 
     if size < 1.0:  # Minimum $1 trade
-        return None
+        return None, adjusted_edge, required_edge
 
-    return TradeRecommendation(
+    rec = TradeRecommendation(
         market_id=market.id,
         market_question=market.question,
         side=side,
@@ -166,3 +218,4 @@ def build_recommendation(
         confidence_low=estimate.confidence_low,
         confidence_high=estimate.confidence_high,
     )
+    return rec, adjusted_edge, required_edge

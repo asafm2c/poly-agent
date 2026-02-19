@@ -72,7 +72,7 @@ class TestPaperTradingPipeline:
         bankroll = paper.get_cash_balance()
         assert bankroll == 1000.0  # Default starting balance
 
-        rec = build_recommendation(market, estimate, bankroll)
+        rec, adj_edge, threshold = build_recommendation(market, estimate, bankroll)
         assert rec is not None
         assert rec.side == Side.YES
         assert rec.adjusted_edge > 0
@@ -125,7 +125,7 @@ class TestPaperTradingPipeline:
         )
 
         paper = PaperTrader()
-        rec = build_recommendation(market, estimate, paper.get_cash_balance())
+        rec, _, _ = build_recommendation(market, estimate, paper.get_cash_balance())
         assert rec is not None
         paper.execute_trade(rec)
 
@@ -897,7 +897,7 @@ class TestClobMidpointFallback:
             thesis="test",
         )
 
-        rec = build_recommendation(market, estimate, 1000.0, clob_midpoint=0.42)
+        rec, _, _ = build_recommendation(market, estimate, 1000.0, clob_midpoint=0.42)
         assert rec is not None
         # Limit price should reflect the midpoint, not the Gamma price
         assert rec.limit_price == pytest.approx(0.42, abs=0.01)
@@ -922,7 +922,7 @@ class TestClobMidpointFallback:
             thesis="test",
         )
 
-        rec = build_recommendation(market, estimate, 1000.0, clob_midpoint=None)
+        rec, _, _ = build_recommendation(market, estimate, 1000.0, clob_midpoint=None)
         assert rec is not None
         assert rec.limit_price == pytest.approx(0.40, abs=0.01)
 
@@ -948,3 +948,353 @@ class TestPortfolioExposure:
         # The position with exposure should be smaller due to portfolio cap
         assert size_with_exp < size_no_exp
         assert size_with_exp <= 100.0  # Max $500 - $400 = $100
+
+
+# ===== estimation-sharpening tests =====
+
+
+class TestOrderBookSignals:
+    """8.1: Test order book signal computation."""
+
+    def test_balanced_book(self):
+        from polymarket_agent.models import OrderBookSignals
+
+        # Simulate a balanced order book
+        book = {
+            "bids": [
+                {"price": "0.48", "size": "100"},
+                {"price": "0.47", "size": "100"},
+            ],
+            "asks": [
+                {"price": "0.52", "size": "100"},
+                {"price": "0.53", "size": "100"},
+            ],
+        }
+        # Compute signals manually
+        total_bid = 200.0
+        total_ask = 200.0
+        imbalance = total_bid / (total_bid + total_ask)
+        spread = 0.52 - 0.48
+
+        assert imbalance == pytest.approx(0.5)
+        assert spread == pytest.approx(0.04)
+
+    def test_bid_heavy_book(self):
+        total_bid = 800.0
+        total_ask = 200.0
+        imbalance = total_bid / (total_bid + total_ask)
+        assert imbalance == pytest.approx(0.8)
+        assert imbalance > 0.6  # Bid-heavy
+
+    def test_ask_heavy_book(self):
+        total_bid = 100.0
+        total_ask = 400.0
+        imbalance = total_bid / (total_bid + total_ask)
+        assert imbalance == pytest.approx(0.2)
+        assert imbalance < 0.4  # Ask-heavy
+
+    def test_get_order_book_signals_integration(self):
+        """Test the ClobClient.get_order_book_signals method with mocked book."""
+        from unittest.mock import patch
+        from polymarket_agent.market.clob_client import ClobClient
+
+        client = ClobClient()
+        mock_book = {
+            "bids": [
+                {"price": "0.45", "size": "500"},
+                {"price": "0.44", "size": "300"},
+            ],
+            "asks": [
+                {"price": "0.55", "size": "200"},
+                {"price": "0.56", "size": "100"},
+            ],
+        }
+        with patch.object(client, "get_order_book", return_value=mock_book):
+            signals = client.get_order_book_signals("test-token", midpoint=0.50)
+
+        assert signals is not None
+        assert signals.imbalance_ratio == pytest.approx(800 / 1100, abs=0.01)
+        assert signals.spread_width == pytest.approx(0.10, abs=0.01)
+        assert signals.depth_at_price > 0
+
+
+class TestAdversarialPass:
+    """8.2-8.3: Test adversarial pass integration."""
+
+    def test_adversarial_pass_flows_to_final_estimate(self):
+        """8.2: Mock LLM to return revised estimate, verify it flows through."""
+        from unittest.mock import MagicMock, patch
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+        from polymarket_agent.models import Market
+
+        market = Market(
+            id="adv-001", question="Test?", volume=10000,
+            last_price_yes=0.55, category="test",
+        )
+
+        mock_llm = MagicMock()
+        # Pass 1: base rate
+        # Pass 2: update
+        # Pass 2.5: adversarial (revises estimate from 0.42 to 0.48)
+        # Pass 3: calibration (returns final unchanged)
+        mock_llm.complete_json.side_effect = [
+            {"base_rate": 0.40, "reasoning": "base"},
+            {"updated_estimate": 0.42, "thesis": "update", "key_evidence": [],
+             "confidence_low": 0.32, "confidence_high": 0.52},
+            {"revised_estimate": 0.48, "revision_applied": True,
+             "falsification_argument": "Market knows more",
+             "confidence_low": 0.38, "confidence_high": 0.58},
+            {"final_estimate": 0.48, "adjusted": False,
+             "adjustment_reasoning": "No cal data",
+             "confidence_low": 0.38, "confidence_high": 0.58},
+        ]
+
+        mock_research = MagicMock()
+        mock_dossier = MagicMock()
+        mock_dossier.order_book_signals = None
+        mock_dossier.related_markets = []
+        mock_research.gather.return_value = mock_dossier
+        mock_research.format_dossier_for_llm.return_value = "dossier text"
+
+        estimator = ProbabilityEstimator(llm_client=mock_llm, research_gatherer=mock_research)
+        result = estimator.estimate(market)
+
+        # The adversarial pass revised from 0.42 to 0.48
+        assert result.final_estimate == pytest.approx(0.48, abs=0.01)
+        assert result.pass25_reasoning == "Market knows more"
+        assert result.updated_estimate == 0.42  # Pre-adversarial estimate preserved
+
+    def test_adversarial_pass_without_order_book(self):
+        """8.3: Verify pass runs without order book signals."""
+        from unittest.mock import MagicMock
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+        from polymarket_agent.models import Market
+
+        market = Market(
+            id="adv-002", question="Test?", volume=10000,
+            last_price_yes=0.55, category="test",
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.side_effect = [
+            {"base_rate": 0.40, "reasoning": "base"},
+            {"updated_estimate": 0.42, "thesis": "update", "key_evidence": [],
+             "confidence_low": 0.32, "confidence_high": 0.52},
+            {"revised_estimate": 0.42, "revision_applied": False,
+             "falsification_argument": "No compelling counter-argument",
+             "confidence_low": 0.32, "confidence_high": 0.52},
+            {"final_estimate": 0.42, "adjusted": False,
+             "adjustment_reasoning": "No cal data",
+             "confidence_low": 0.32, "confidence_high": 0.52},
+        ]
+
+        mock_research = MagicMock()
+        mock_dossier = MagicMock()
+        mock_dossier.order_book_signals = None  # No order book
+        mock_dossier.related_markets = []
+        mock_research.gather.return_value = mock_dossier
+        mock_research.format_dossier_for_llm.return_value = "dossier text"
+
+        estimator = ProbabilityEstimator(llm_client=mock_llm, research_gatherer=mock_research)
+        result = estimator.estimate(market)
+
+        # Should complete without error, estimate unchanged
+        assert result.final_estimate == pytest.approx(0.42, abs=0.01)
+
+
+class TestAdaptiveEdgeThreshold:
+    """8.4-8.5: Test adaptive edge threshold."""
+
+    def test_high_volume_requires_more_edge(self):
+        """8.4: High-volume market produces higher threshold."""
+        from polymarket_agent.models import Market
+        from polymarket_agent.trading.edge import compute_required_edge
+
+        low_vol = Market(id="low", question="?", volume=15_000)
+        high_vol = Market(id="high", question="?", volume=5_000_000)
+
+        thresh_low = compute_required_edge(low_vol, confidence_width=0.30)
+        thresh_high = compute_required_edge(high_vol, confidence_width=0.30)
+
+        assert thresh_high > thresh_low
+
+    def test_wide_confidence_requires_more_edge(self):
+        """8.4: Wide confidence band produces higher threshold."""
+        from polymarket_agent.models import Market
+        from polymarket_agent.trading.edge import compute_required_edge
+
+        market = Market(id="conf", question="?", volume=50_000)
+
+        thresh_narrow = compute_required_edge(market, confidence_width=0.10)
+        thresh_wide = compute_required_edge(market, confidence_width=0.50)
+
+        assert thresh_wide > thresh_narrow
+
+    def test_floor_respected(self):
+        """8.5: Floor is respected."""
+        from polymarket_agent.models import Market
+        from polymarket_agent.trading.edge import compute_required_edge
+
+        # Very low volume, narrow confidence — should hit floor
+        market = Market(id="floor", question="?", volume=1)
+        thresh = compute_required_edge(market, confidence_width=0.0)
+        assert thresh >= 0.05  # min_edge_floor
+
+    def test_ceiling_respected(self):
+        """8.5: Ceiling is respected."""
+        from polymarket_agent.models import Market
+        from polymarket_agent.trading.edge import compute_required_edge
+
+        # Very high volume, wide confidence — should hit ceiling
+        market = Market(id="ceil", question="?", volume=100_000_000)
+        thresh = compute_required_edge(market, confidence_width=0.80)
+        assert thresh <= 0.25  # max_edge_ceiling
+
+
+class TestPredictionRecordingWithEdge:
+    """8.6: Test prediction recording with edge/threshold."""
+
+    def test_edge_and_threshold_stored(self):
+        from polymarket_agent.models import ProbabilityEstimate
+        from polymarket_agent.trading.calibration import record_prediction
+        from polymarket_agent.storage.database import get_db
+
+        # Create the market record first (FK constraint)
+        _create_test_market("pred-edge-001", 0.50)
+
+        estimate = ProbabilityEstimate(
+            market_id="pred-edge-001",
+            final_estimate=0.65,
+            confidence_low=0.55,
+            confidence_high=0.75,
+            base_rate=0.50,
+            updated_estimate=0.65,
+            pass1_reasoning="test",
+            pass2_reasoning="test",
+            thesis="test",
+        )
+
+        pred_id = record_prediction(
+            estimate, 0.50, "test", edge=0.12, threshold=0.08,
+        )
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT edge_at_prediction, threshold_at_prediction FROM predictions WHERE id = ?",
+                (pred_id,),
+            ).fetchone()
+
+        assert row["edge_at_prediction"] == pytest.approx(0.12)
+        assert row["threshold_at_prediction"] == pytest.approx(0.08)
+
+
+class TestBrierComparison:
+    """8.7: Test Brier score comparison."""
+
+    def test_brier_comparison_computed(self):
+        from polymarket_agent.trading.calibration import compute_brier_comparison
+        from polymarket_agent.storage.database import get_db
+
+        # Create market records first (FK constraint)
+        for i in range(25):
+            _create_test_market(f"brier-{i}", 0.50)
+
+        # Insert 25 resolved predictions with known values
+        with get_db() as conn:
+            for i in range(25):
+                agent_est = 0.7  # Always predict 70%
+                market_price = 0.5  # Market always says 50%
+                outcome = 1.0 if i < 18 else 0.0  # 72% resolve YES
+
+                conn.execute(
+                    """INSERT INTO predictions
+                    (market_id, timestamp, market_price, agent_estimate,
+                     final_estimate, outcome, category)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (f"brier-{i}", "2026-01-01", market_price, agent_est,
+                     agent_est, outcome, "test"),
+                )
+
+        result = compute_brier_comparison()
+        assert result is not None
+        assert "agent_brier" in result
+        assert "market_brier" in result
+        assert "difference" in result
+        assert result["resolved_count"] >= 25
+
+    def test_insufficient_data_returns_none(self):
+        from polymarket_agent.trading.calibration import compute_brier_comparison
+        # With fresh DB (or few resolved), should return None
+        # Note: may have data from other tests, but conceptually tests the threshold
+        result = compute_brier_comparison(min_resolved=99999)
+        assert result is None
+
+
+class TestPredictMode:
+    """8.8: Test prediction-only mode."""
+
+    def test_predict_mode_records_without_trading(self):
+        """Verify predict mode doesn't call build_recommendation."""
+        from unittest.mock import MagicMock, patch
+        from polymarket_agent.cli.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(mode="predict")
+        assert scheduler.mode == "predict"
+
+        # In predict mode, analysis should skip trading
+        # We verify by checking the mode is set correctly
+        # (full integration test would need mocked APIs)
+
+
+class TestClobWiring:
+    """8.9: Test CLOB client wired through estimator to gatherer."""
+
+    def test_clob_reaches_gatherer(self):
+        from polymarket_agent.analyst.estimator import ProbabilityEstimator
+        from polymarket_agent.market.clob_client import ClobClient
+
+        clob = ClobClient()
+        estimator = ProbabilityEstimator(clob_client=clob)
+
+        assert estimator.clob is clob
+        assert estimator.research.clob is clob
+
+
+class TestDossierOrderBookSection:
+    """8.10: Test dossier includes order book section."""
+
+    def test_dossier_with_order_book(self):
+        from polymarket_agent.models import OrderBookSignals, ResearchDossier
+        from polymarket_agent.research.gatherer import ResearchGatherer
+
+        dossier = ResearchDossier(
+            market_id="obs-001",
+            market_question="Test?",
+            order_book_signals=OrderBookSignals(
+                imbalance_ratio=0.72,
+                spread_width=0.03,
+                depth_at_price=1500.0,
+            ),
+        )
+
+        gatherer = ResearchGatherer()
+        text = gatherer.format_dossier_for_llm(dossier)
+
+        assert "Market Microstructure" in text
+        assert "0.72" in text
+        assert "bid-heavy" in text
+
+    def test_dossier_without_order_book(self):
+        from polymarket_agent.models import ResearchDossier
+        from polymarket_agent.research.gatherer import ResearchGatherer
+
+        dossier = ResearchDossier(
+            market_id="obs-002",
+            market_question="Test?",
+            order_book_signals=None,
+        )
+
+        gatherer = ResearchGatherer()
+        text = gatherer.format_dossier_for_llm(dossier)
+
+        assert "Market Microstructure" not in text

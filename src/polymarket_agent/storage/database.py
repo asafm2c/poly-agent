@@ -80,7 +80,9 @@ MIGRATIONS = [
         category TEXT,
         outcome REAL,
         prediction_error REAL,
-        resolved_at TEXT
+        resolved_at TEXT,
+        edge_at_prediction REAL,
+        threshold_at_prediction REAL
     );
 
     CREATE TABLE IF NOT EXISTS portfolio (
