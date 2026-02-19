@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Polymarket Agent Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="https://cdn.plot.ly/plotly-basic-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --muted: #94a3b8;
+      --card-bg: #1e293b;
+    }
+    body { padding: 0; margin: 0; background: #0f172a; color: #e2e8f0; }
+    nav.top-nav {
+      display: flex; align-items: center; gap: 1rem;
+      padding: 0.75rem 1.5rem;
+      background: #1e293b; border-bottom: 1px solid #334155;
+      position: sticky; top: 0; z-index: 100;
+    }
+    nav.top-nav h1 { margin: 0; font-size: 1.1rem; white-space: nowrap; }
+    .tabs { display: flex; gap: 0.25rem; margin-left: 1.5rem; }
+    .tabs button {
+      background: transparent; border: none; color: #94a3b8;
+      padding: 0.5rem 1rem; cursor: pointer; border-radius: 6px;
+      font-size: 0.9rem; transition: all 0.15s;
+    }
+    .tabs button:hover { background: #334155; color: #e2e8f0; }
+    .tabs button.active { background: #3b82f6; color: white; }
+    .status-badge {
+      margin-left: auto; padding: 0.25rem 0.75rem;
+      border-radius: 9999px; font-size: 0.75rem; font-weight: 600;
+    }
+    .status-ok { background: #166534; color: #86efac; }
+    .status-alert { background: #991b1b; color: #fca5a5; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .refresh-info { font-size: 0.7rem; color: var(--muted); white-space: nowrap; }
+
+    main { padding: 1rem 1.5rem; max-width: 1400px; margin: 0 auto; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* KPI cards */
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+    .kpi-card {
+      background: var(--card-bg); border-radius: 8px; padding: 1rem;
+      border: 1px solid #334155;
+    }
+    .kpi-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.25rem; }
+    .kpi-value { font-size: 1.5rem; font-weight: 700; }
+    .kpi-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .neutral { color: var(--muted); }
+
+    /* Charts */
+    .chart-container {
+      background: var(--card-bg); border-radius: 8px; padding: 1rem;
+      border: 1px solid #334155; margin-bottom: 1rem;
+    }
+    .chart-title { font-size: 0.9rem; font-weight: 600; margin-bottom: 0.5rem; }
+
+    /* Tables */
+    .data-table {
+      width: 100%; border-collapse: collapse; font-size: 0.8rem;
+      background: var(--card-bg); border-radius: 8px; overflow: hidden;
+      border: 1px solid #334155;
+    }
+    .data-table th {
+      text-align: left; padding: 0.6rem 0.75rem;
+      background: #334155; color: #94a3b8; font-weight: 600;
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .data-table td { padding: 0.5rem 0.75rem; border-top: 1px solid #1e293b; }
+    .data-table tr:hover td { background: #1e293b; }
+    .text-truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Two-column layout */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center; padding: 3rem 1rem; color: var(--muted);
+      font-style: italic;
+    }
+
+    /* Price history expand */
+    .expand-btn {
+      background: none; border: none; color: #3b82f6; cursor: pointer;
+      font-size: 0.75rem; padding: 0;
+    }
+    .expand-btn:hover { text-decoration: underline; }
+    .price-chart-row td { padding: 0 !important; }
+    .price-chart-row .chart-inline { height: 200px; }
+
+    /* Thesis tooltip */
+    .thesis-text {
+      max-width: 250px; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; cursor: help;
+    }
+    .thesis-text:hover { white-space: normal; overflow: visible; position: relative; z-index: 10; background: #1e293b; }
+  </style>
+</head>
+<body>
+  <nav class="top-nav">
+    <h1>Polymarket Agent</h1>
+    <div class="tabs">
+      <button class="active" data-tab="portfolio">Portfolio</button>
+      <button data-tab="positions">Positions</button>
+      <button data-tab="calibration">Calibration</button>
+      <button data-tab="operations">Operations</button>
+    </div>
+    <span id="kill-switch-badge" class="status-badge status-ok">TRADING ACTIVE</span>
+    <span class="refresh-info" id="refresh-info">Loading...</span>
+  </nav>
+
+  <main>
+    <!-- PORTFOLIO TAB -->
+    <div id="tab-portfolio" class="tab-content active">
+      <div class="kpi-grid" id="portfolio-kpis"></div>
+      <div class="chart-container">
+        <div class="chart-title">Equity Curve</div>
+        <div id="equity-chart" style="height:350px;"></div>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Daily P&amp;L</div>
+        <div id="daily-pnl-chart" style="height:250px;"></div>
+      </div>
+    </div>
+
+    <!-- POSITIONS TAB -->
+    <div id="tab-positions" class="tab-content">
+      <div class="chart-container">
+        <div class="chart-title">Open Positions</div>
+        <div id="open-positions-table"></div>
+      </div>
+      <div class="grid-2">
+        <div class="chart-container">
+          <div class="chart-title">Closed Positions (Recent)</div>
+          <div id="closed-positions-table"></div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-title">Recent Trades</div>
+          <div id="trades-table"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CALIBRATION TAB -->
+    <div id="tab-calibration" class="tab-content">
+      <div class="kpi-grid" id="calibration-kpis"></div>
+      <div class="grid-2">
+        <div class="chart-container">
+          <div class="chart-title">Calibration Curve</div>
+          <div id="calibration-chart" style="height:350px;"></div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-title">Predictions vs Outcomes</div>
+          <div id="scatter-chart" style="height:350px;"></div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Category Performance</div>
+        <div id="category-chart" style="height:300px;"></div>
+      </div>
+    </div>
+
+    <!-- OPERATIONS TAB -->
+    <div id="tab-operations" class="tab-content">
+      <div class="kpi-grid" id="operations-kpis"></div>
+      <div class="chart-container">
+        <div class="chart-title">Recent Predictions</div>
+        <div id="predictions-table"></div>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Daily Trade Count (Last 30 Days)</div>
+        <div id="trade-count-chart" style="height:250px;"></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // --- State ---
+    let activeTab = 'portfolio';
+    const REFRESH_MS = 30000;
+    const PLOTLY_DARK = {
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      font: { color: '#94a3b8', size: 11 },
+      margin: { t: 10, r: 20, b: 40, l: 60 },
+      xaxis: { gridcolor: '#334155', zerolinecolor: '#334155' },
+      yaxis: { gridcolor: '#334155', zerolinecolor: '#334155' },
+    };
+    const PLOTLY_CONFIG = { displayModeBar: false, responsive: true };
+
+    // --- Helpers ---
+    function $(sel) { return document.querySelector(sel); }
+    function $$(sel) { return document.querySelectorAll(sel); }
+
+    async function api(path) {
+      const res = await fetch(`/api${path}`);
+      if (!res.ok) return null;
+      return res.json();
+    }
+
+    function fmt$(v) {
+      if (v == null) return '-';
+      const abs = Math.abs(v);
+      return (v < 0 ? '-' : '') + '$' + abs.toFixed(2);
+    }
+    function fmtPct(v) { return v == null ? '-' : v.toFixed(1) + '%'; }
+    function fmtProb(v) { return v == null ? '-' : (v * 100).toFixed(1) + '%'; }
+    function pnlClass(v) { return v > 0.005 ? 'positive' : v < -0.005 ? 'negative' : 'neutral'; }
+    function truncate(s, n) { return s && s.length > n ? s.substring(0, n) + '...' : (s || '-'); }
+
+    function kpiCard(label, value, sub, cssClass) {
+      return `<div class="kpi-card">
+        <div class="kpi-label">${label}</div>
+        <div class="kpi-value ${cssClass || ''}">${value}</div>
+        ${sub ? `<div class="kpi-sub">${sub}</div>` : ''}
+      </div>`;
+    }
+
+    // --- Tab switching ---
+    $$('.tabs button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.tabs button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        $$('.tab-content').forEach(t => t.classList.remove('active'));
+        $(`#tab-${btn.dataset.tab}`).classList.add('active');
+        activeTab = btn.dataset.tab;
+        refresh();
+      });
+    });
+
+    // --- Portfolio ---
+    async function refreshPortfolio() {
+      const [summary, curve] = await Promise.all([
+        api('/portfolio/summary'),
+        api('/portfolio/equity-curve'),
+      ]);
+      if (!summary) return;
+
+      // Kill switch badge
+      const badge = $('#kill-switch-badge');
+      if (summary.kill_switch_active) {
+        badge.className = 'status-badge status-alert';
+        badge.textContent = 'KILL SWITCH ACTIVE';
+      } else {
+        badge.className = 'status-badge status-ok';
+        badge.textContent = 'TRADING ACTIVE';
+      }
+
+      // KPIs
+      $('#portfolio-kpis').innerHTML = [
+        kpiCard('Portfolio Value', fmt$(summary.total_portfolio_value),
+          `${summary.open_positions} open position${summary.open_positions !== 1 ? 's' : ''}`),
+        kpiCard('Cash Balance', fmt$(summary.cash_balance), `Mode: ${summary.mode}`),
+        kpiCard('Total Return', fmtPct(summary.total_return_pct), `Realized: ${fmt$(summary.realized_pnl)}`,
+          pnlClass(summary.total_return_pct)),
+        kpiCard("Today's P&L", fmt$(summary.today_pnl),
+          `Unrealized: ${fmt$(summary.unrealized_pnl)}`,
+          pnlClass(summary.today_pnl)),
+      ].join('');
+
+      // Equity curve
+      if (curve && curve.dates.length > 0) {
+        Plotly.react('equity-chart', [{
+          x: curve.dates, y: curve.portfolio_value,
+          type: 'scatter', mode: 'lines',
+          line: { color: '#3b82f6', width: 2 },
+          fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.1)',
+          name: 'Portfolio Value',
+        }], {
+          ...PLOTLY_DARK,
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Value ($)', tickprefix: '$' },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date', rangeslider: { visible: true, thickness: 0.06 } },
+        }, PLOTLY_CONFIG);
+
+        // Daily P&L bars
+        const colors = curve.total_pnl.map(v => v >= 0 ? '#22c55e' : '#ef4444');
+        Plotly.react('daily-pnl-chart', [{
+          x: curve.dates, y: curve.total_pnl,
+          type: 'bar',
+          marker: { color: colors },
+          name: 'Daily P&L',
+        }], {
+          ...PLOTLY_DARK,
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'P&L ($)', tickprefix: '$' },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#equity-chart').innerHTML = '<div class="empty-state">No daily P&L data yet. Data appears after the agent runs its daily report.</div>';
+        $('#daily-pnl-chart').innerHTML = '';
+      }
+    }
+
+    // --- Positions ---
+    async function refreshPositions() {
+      const [openData, closedData, tradesData] = await Promise.all([
+        api('/positions/open'),
+        api('/positions/closed?limit=20'),
+        api('/positions/trades?limit=30'),
+      ]);
+
+      // Open positions
+      if (openData && openData.positions.length > 0) {
+        const rows = openData.positions.map(p => `
+          <tr>
+            <td class="text-truncate" title="${p.market_question}">${truncate(p.market_question, 40)}</td>
+            <td>${p.side}</td>
+            <td>${p.size.toFixed(2)}</td>
+            <td>${fmtProb(p.entry_price)}</td>
+            <td>${fmtProb(p.current_price)}</td>
+            <td class="${pnlClass(p.unrealized_pnl)}">${fmt$(p.unrealized_pnl)}</td>
+            <td class="${pnlClass(p.return_pct)}">${fmtPct(p.return_pct)}</td>
+            <td>${p.agent_estimate != null ? fmtProb(p.agent_estimate) : '-'}</td>
+            <td class="${p.edge_remaining != null ? pnlClass(p.edge_remaining) : 'neutral'}">${p.edge_remaining != null ? fmtProb(p.edge_remaining) : '-'}</td>
+            <td>${p.days_held}d</td>
+            <td><button class="expand-btn" data-mid="${p.market_id}" onclick="togglePriceChart(this)">chart</button></td>
+          </tr>
+        `).join('');
+        $('#open-positions-table').innerHTML = `
+          <table class="data-table">
+            <thead><tr>
+              <th>Market</th><th>Side</th><th>Shares</th><th>Entry</th><th>Current</th>
+              <th>Unreal. P&L</th><th>Return</th><th>Estimate</th><th>Edge</th><th>Held</th><th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      } else {
+        $('#open-positions-table').innerHTML = '<div class="empty-state">No open positions</div>';
+      }
+
+      // Closed positions
+      if (closedData && closedData.positions.length > 0) {
+        const rows = closedData.positions.map(p => `
+          <tr>
+            <td class="text-truncate" title="${p.market_question}">${truncate(p.market_question, 30)}</td>
+            <td>${p.side}</td>
+            <td>${p.size.toFixed(2)}</td>
+            <td>${fmtProb(p.entry_price)}</td>
+            <td>${p.exit_price != null ? fmtProb(p.exit_price) : '-'}</td>
+            <td class="${pnlClass(p.realized_pnl)}">${fmt$(p.realized_pnl)}</td>
+          </tr>
+        `).join('');
+        $('#closed-positions-table').innerHTML = `
+          <table class="data-table">
+            <thead><tr><th>Market</th><th>Side</th><th>Shares</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      } else {
+        $('#closed-positions-table').innerHTML = '<div class="empty-state">No closed positions</div>';
+      }
+
+      // Trades
+      if (tradesData && tradesData.trades.length > 0) {
+        const rows = tradesData.trades.map(t => `
+          <tr>
+            <td style="font-size:0.7rem">${new Date(t.timestamp).toLocaleDateString()}</td>
+            <td class="text-truncate" title="${t.market_question}">${truncate(t.market_question, 25)}</td>
+            <td>${t.action.toUpperCase()}</td>
+            <td>${t.side}</td>
+            <td>${t.size.toFixed(2)}</td>
+            <td>${fmtProb(t.price)}</td>
+            <td>${fmt$(t.cost)}</td>
+          </tr>
+        `).join('');
+        $('#trades-table').innerHTML = `
+          <table class="data-table">
+            <thead><tr><th>Date</th><th>Market</th><th>Action</th><th>Side</th><th>Shares</th><th>Price</th><th>Cost</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      } else {
+        $('#trades-table').innerHTML = '<div class="empty-state">No trades yet</div>';
+      }
+    }
+
+    // Price chart expand
+    async function togglePriceChart(btn) {
+      const mid = btn.dataset.mid;
+      const tr = btn.closest('tr');
+      const existing = tr.nextElementSibling;
+      if (existing && existing.classList.contains('price-chart-row')) {
+        existing.remove();
+        return;
+      }
+      const data = await api(`/positions/price-history/${mid}`);
+      if (!data || data.timestamps.length === 0) return;
+      const newRow = document.createElement('tr');
+      newRow.className = 'price-chart-row';
+      newRow.innerHTML = `<td colspan="11"><div class="chart-inline" id="ph-${mid.replace(/[^a-zA-Z0-9]/g, '')}"></div></td>`;
+      tr.after(newRow);
+      const chartId = `ph-${mid.replace(/[^a-zA-Z0-9]/g, '')}`;
+      Plotly.newPlot(chartId, [{
+        x: data.timestamps, y: data.price_yes,
+        type: 'scatter', mode: 'lines',
+        line: { color: '#3b82f6', width: 1.5 },
+        name: 'YES Price',
+      }], {
+        ...PLOTLY_DARK,
+        height: 180,
+        margin: { t: 5, r: 10, b: 30, l: 50 },
+        yaxis: { ...PLOTLY_DARK.yaxis, tickformat: '.0%' },
+        xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+      }, PLOTLY_CONFIG);
+    }
+
+    // --- Calibration ---
+    async function refreshCalibration() {
+      const [report, scatter] = await Promise.all([
+        api('/calibration/report'),
+        api('/calibration/scatter'),
+      ]);
+      if (!report) return;
+
+      // KPIs
+      const brierLabel = report.brier_score != null ? report.brier_score.toFixed(4) : '-';
+      const mktBrier = report.market_brier_score != null ? report.market_brier_score.toFixed(4) : '-';
+      let comparison = '-';
+      let compClass = 'neutral';
+      if (report.brier_score != null && report.market_brier_score != null) {
+        const diff = report.brier_score - report.market_brier_score;
+        comparison = diff < 0 ? 'Agent Better' : diff > 0 ? 'Market Better' : 'Tied';
+        compClass = diff < 0 ? 'positive' : diff > 0 ? 'negative' : 'neutral';
+      }
+      $('#calibration-kpis').innerHTML = [
+        kpiCard('Agent Brier Score', brierLabel, 'Lower is better (0.25 = coin flip)'),
+        kpiCard('Market Brier Score', mktBrier, 'Market price as forecast'),
+        kpiCard('Comparison', comparison, report.brier_score != null && report.market_brier_score != null
+          ? `Diff: ${(report.brier_score - report.market_brier_score).toFixed(4)}` : '', compClass),
+        kpiCard('Predictions', `${report.resolved_predictions} / ${report.total_predictions}`,
+          `${report.total_predictions - report.resolved_predictions} pending`),
+      ].join('');
+
+      // Calibration curve
+      if (report.buckets.length > 0) {
+        Plotly.react('calibration-chart', [
+          {
+            x: report.buckets.map(b => b.avg_predicted),
+            y: report.buckets.map(b => b.actual_rate),
+            text: report.buckets.map(b => `n=${b.count}`),
+            textposition: 'top center',
+            mode: 'markers+text',
+            marker: { size: report.buckets.map(b => Math.max(8, Math.min(30, b.count * 2))), color: '#3b82f6' },
+            name: 'Agent',
+            type: 'scatter',
+          },
+          {
+            x: [0, 1], y: [0, 1],
+            mode: 'lines',
+            line: { dash: 'dash', color: '#475569', width: 1 },
+            name: 'Perfect',
+            type: 'scatter',
+          }
+        ], {
+          ...PLOTLY_DARK,
+          xaxis: { ...PLOTLY_DARK.xaxis, title: 'Predicted Probability', range: [0, 1], tickformat: '.0%' },
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Actual Frequency', range: [0, 1], tickformat: '.0%' },
+          showlegend: true, legend: { x: 0.02, y: 0.98 },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#calibration-chart').innerHTML = '<div class="empty-state">Not enough resolved predictions for calibration curve</div>';
+      }
+
+      // Scatter plot
+      if (scatter && scatter.predictions.length > 0) {
+        const cats = [...new Set(scatter.predictions.map(p => p.category || 'unknown'))];
+        const catColors = { politics: '#3b82f6', crypto: '#f59e0b', sports: '#22c55e', science: '#a855f7', unknown: '#94a3b8' };
+        const traces = cats.map(cat => {
+          const pts = scatter.predictions.filter(p => (p.category || 'unknown') === cat);
+          return {
+            x: pts.map(p => p.agent_estimate),
+            y: pts.map(p => p.outcome),
+            mode: 'markers',
+            marker: { color: catColors[cat] || '#94a3b8', size: 6, opacity: 0.7 },
+            name: cat,
+            type: 'scatter',
+          };
+        });
+        Plotly.react('scatter-chart', traces, {
+          ...PLOTLY_DARK,
+          xaxis: { ...PLOTLY_DARK.xaxis, title: 'Agent Estimate', range: [0, 1], tickformat: '.0%' },
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Outcome (0 or 1)', range: [-0.1, 1.1] },
+          showlegend: true, legend: { x: 0.02, y: 0.98 },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#scatter-chart').innerHTML = '<div class="empty-state">No resolved predictions yet</div>';
+      }
+
+      // Category breakdown
+      if (report.category_breakdown.length > 0) {
+        Plotly.react('category-chart', [
+          {
+            x: report.category_breakdown.map(c => c.category),
+            y: report.category_breakdown.map(c => c.brier_score),
+            name: 'Agent', type: 'bar',
+            marker: { color: '#3b82f6' },
+          },
+          {
+            x: report.category_breakdown.map(c => c.category),
+            y: report.category_breakdown.map(c => c.market_brier),
+            name: 'Market', type: 'bar',
+            marker: { color: '#475569' },
+          }
+        ], {
+          ...PLOTLY_DARK,
+          barmode: 'group',
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Brier Score (lower = better)' },
+          showlegend: true, legend: { x: 0.02, y: 0.98 },
+          annotations: report.category_breakdown.map(c => ({
+            x: c.category, y: Math.max(c.brier_score, c.market_brier) + 0.01,
+            text: `n=${c.count}`, showarrow: false, font: { size: 10, color: '#94a3b8' },
+          })),
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#category-chart').innerHTML = '<div class="empty-state">No category data yet</div>';
+      }
+    }
+
+    // --- Operations ---
+    async function refreshOperations() {
+      const [status, preds] = await Promise.all([
+        api('/operations/status'),
+        api('/operations/predictions?limit=20'),
+      ]);
+      if (!status) return;
+
+      const ks = status.kill_switch;
+      $('#operations-kpis').innerHTML = [
+        kpiCard('Active Markets', status.active_markets.toLocaleString(),
+          `${status.total_markets.toLocaleString()} total indexed`),
+        kpiCard('Categories', status.categories_tracked.toString()),
+        kpiCard('Pending Predictions', status.pending_predictions.toString(),
+          `${status.open_orders} open orders`),
+        kpiCard('Kill Switch', ks.active ? 'ACTIVE' : 'Inactive',
+          ks.active ? ks.reason : '', ks.active ? 'negative' : 'positive'),
+      ].join('');
+
+      // Predictions table
+      if (preds && preds.predictions.length > 0) {
+        const rows = preds.predictions.map(p => {
+          const edgeStr = p.edge != null ? fmtProb(p.edge) : '-';
+          const threshStr = p.threshold != null ? fmtProb(p.threshold) : '-';
+          const resolvedBadge = p.resolved
+            ? `<span style="color:${p.outcome === 1 ? 'var(--green)' : 'var(--red)'}">
+                ${p.outcome === 1 ? 'YES' : 'NO'}</span>`
+            : '<span style="color:var(--muted)">pending</span>';
+          return `<tr>
+            <td style="font-size:0.7rem">${new Date(p.timestamp).toLocaleString()}</td>
+            <td class="text-truncate" title="${p.market_question}">${truncate(p.market_question, 35)}</td>
+            <td>${p.category || '-'}</td>
+            <td>${fmtProb(p.agent_estimate)}</td>
+            <td>${fmtProb(p.market_price)}</td>
+            <td class="${p.edge != null ? pnlClass(p.edge) : 'neutral'}">${edgeStr}</td>
+            <td>${threshStr}</td>
+            <td>${resolvedBadge}</td>
+            <td class="thesis-text" title="${p.thesis || ''}">${truncate(p.thesis, 30)}</td>
+          </tr>`;
+        }).join('');
+        $('#predictions-table').innerHTML = `
+          <table class="data-table">
+            <thead><tr>
+              <th>Time</th><th>Market</th><th>Category</th><th>Estimate</th><th>Mkt Price</th>
+              <th>Edge</th><th>Threshold</th><th>Outcome</th><th>Thesis</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      } else {
+        $('#predictions-table').innerHTML = '<div class="empty-state">No predictions recorded yet</div>';
+      }
+
+      // Trade count chart
+      if (status.recent_activity.length > 0) {
+        const activity = [...status.recent_activity].reverse();
+        Plotly.react('trade-count-chart', [{
+          x: activity.map(a => a.date),
+          y: activity.map(a => a.trades),
+          type: 'bar',
+          marker: { color: '#3b82f6' },
+          name: 'Trades',
+        }], {
+          ...PLOTLY_DARK,
+          yaxis: { ...PLOTLY_DARK.yaxis, title: 'Trade Count', dtick: 1 },
+          xaxis: { ...PLOTLY_DARK.xaxis, type: 'date' },
+        }, PLOTLY_CONFIG);
+      } else {
+        $('#trade-count-chart').innerHTML = '<div class="empty-state">No recent activity</div>';
+      }
+    }
+
+    // --- Refresh orchestration ---
+    async function refresh() {
+      try {
+        switch (activeTab) {
+          case 'portfolio': await refreshPortfolio(); break;
+          case 'positions': await refreshPositions(); break;
+          case 'calibration': await refreshCalibration(); break;
+          case 'operations': await refreshOperations(); break;
+        }
+        $('#refresh-info').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        $('#refresh-info').textContent = `Error: ${err.message}`;
+        console.error('Refresh error:', err);
+      }
+    }
+
+    // Initial load + auto-refresh
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>
