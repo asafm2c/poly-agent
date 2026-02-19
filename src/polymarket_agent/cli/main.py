@@ -408,19 +408,27 @@ def backtest():
 
 
 @backtest.command()
-def collect():
+@click.option("--histories-only", is_flag=True, help="Skip market collection, only fetch price histories")
+@click.option("--min-volume", type=float, default=None, help="Only fetch histories for markets above this volume")
+def collect(histories_only: bool, min_volume: float | None):
     """Collect resolved markets and price histories from Polymarket."""
     from polymarket_agent.backtest.collector import BacktestCollector
 
     collector = BacktestCollector()
     try:
-        with console.status("Collecting resolved markets..."):
-            result = collector.collect()
-
-        console.print(f"\n[bold green]Collection complete[/]")
-        console.print(f"  Markets collected: {result['markets_collected']}")
-        console.print(f"  Price histories collected: {result['history_collected']}")
-        console.print(f"  Skipped: {result['history_skipped']}")
+        if histories_only:
+            console.print("Collecting price histories only...")
+            collected, skipped = collector.collect_histories_only(min_volume=min_volume)
+            console.print(f"\n[bold green]Collection complete[/]")
+            console.print(f"  Price histories collected: {collected}")
+            console.print(f"  Skipped: {skipped}")
+        else:
+            with console.status("Collecting resolved markets..."):
+                result = collector.collect()
+            console.print(f"\n[bold green]Collection complete[/]")
+            console.print(f"  Markets collected: {result['markets_collected']}")
+            console.print(f"  Price histories collected: {result['history_collected']}")
+            console.print(f"  Skipped: {result['history_skipped']}")
     finally:
         collector.close()
 

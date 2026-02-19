@@ -42,6 +42,13 @@ class BacktestCollector:
             "history_skipped": history_skipped,
         }
 
+    def collect_histories_only(self, min_volume: float | None = None) -> tuple[int, int]:
+        """Run only price history collection, optionally filtered by volume.
+
+        Returns (collected, skipped) counts.
+        """
+        return self._collect_price_histories(min_volume=min_volume)
+
     def _collect_markets(self) -> int:
         """Paginate Gamma API for all resolved markets, upsert into bt_markets."""
         offset = 0
@@ -54,6 +61,7 @@ class BacktestCollector:
                 "closed": "true",
                 "order": "volumeNum",
                 "ascending": "false",
+                "volume_num_min": 10000,
             }
 
             data = self._gamma_request("/markets", params)
@@ -127,8 +135,24 @@ class BacktestCollector:
         events = item.get("events") or []
         event_id = events[0].get("id") if events and isinstance(events[0], dict) else None
 
-        # Resolution outcome
-        resolution = item.get("resolutionSource") or item.get("resolution") or ""
+        # Resolution outcome: derive from outcomePrices (["1", "0"] = YES, ["0", "1"] = NO)
+        resolution = ""
+        outcome_prices = item.get("outcomePrices") or []
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except (ValueError, TypeError):
+                outcome_prices = []
+        if outcome_prices:
+            try:
+                yes_price = float(outcome_prices[0]) if outcome_prices else None
+                if yes_price is not None:
+                    if yes_price >= 0.99:
+                        resolution = "YES"
+                    elif yes_price <= 0.01:
+                        resolution = "NO"
+            except (ValueError, TypeError, IndexError):
+                pass
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -165,17 +189,21 @@ class BacktestCollector:
         )
         return True
 
-    def _collect_price_histories(self) -> tuple[int, int]:
+    def _collect_price_histories(self, min_volume: float | None = None) -> tuple[int, int]:
         """Fetch daily price histories for markets missing them.
 
         Returns (collected, skipped) counts.
         """
+        query = """SELECT id, yes_token FROM bt_markets
+                WHERE has_history = 0 AND yes_token IS NOT NULL"""
+        params: list = []
+        if min_volume is not None:
+            query += " AND volume >= ?"
+            params.append(min_volume)
+        query += " ORDER BY volume DESC"
+
         with get_backtest_db(self.db_path) as conn:
-            rows = conn.execute(
-                """SELECT id, yes_token FROM bt_markets
-                WHERE has_history = 0 AND yes_token IS NOT NULL
-                ORDER BY volume DESC"""
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
         total = len(rows)
         collected = 0
@@ -226,10 +254,11 @@ class BacktestCollector:
                 )
             collected += 1
 
-            if (collected + skipped) % 100 == 0:
+            processed = collected + skipped
+            if processed % 100 == 0 or processed <= 10:
                 logger.info(
-                    "Price history: %d/%d collected, %d skipped (of %d total)",
-                    collected, skipped, skipped, total,
+                    "Price history: %d collected, %d skipped, %d/%d processed",
+                    collected, skipped, processed, total,
                 )
 
         logger.info(
