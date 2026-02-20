@@ -138,16 +138,17 @@ def analyze(market_id: str):
     # Edge calculation
     paper = PaperTrader()
     bankroll = paper.get_cash_balance()
-    rec = build_recommendation(market, estimate, bankroll)
+    rec, adj_edge, req_threshold = build_recommendation(market, estimate, bankroll)
 
     if rec:
         console.print(f"\n[bold yellow]Trade Recommendation:[/]")
         console.print(f"  Side: {rec.side.value}")
         console.print(f"  Edge: {rec.adjusted_edge:.1%} (raw: {rec.raw_edge:.1%})")
+        console.print(f"  Threshold: {req_threshold:.1%}")
         console.print(f"  Size: ${rec.recommended_size:.2f}")
         console.print(f"  Limit price: ${rec.limit_price:.4f}")
     else:
-        console.print("\n[dim]No trade recommended (edge below threshold)[/]")
+        console.print(f"\n[dim]No trade recommended (edge {adj_edge:.1%} below threshold {req_threshold:.1%})[/]")
 
     # Show LLM costs
     usage = estimator.llm.get_usage_summary()

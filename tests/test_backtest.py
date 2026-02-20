@@ -1223,3 +1223,64 @@ class TestEstimationErrorHandling:
         assert len(trials) == 2
         estimates = [t["agent_estimate"] for t in trials]
         assert None in estimates  # One should be NULL
+
+
+class TestPerTrialCostDelta:
+    """6.9 Test that per-trial LLM cost records the delta, not cumulative."""
+
+    def test_cost_delta_per_trial(self):
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            rows = conn.execute(
+                "SELECT * FROM bt_markets WHERE id IN ('sim-market-1', 'sim-market-2')"
+            ).fetchall()
+            markets = []
+            for row in rows:
+                m = dict(row)
+                history = conn.execute(
+                    "SELECT timestamp as t, price as p FROM bt_price_history WHERE market_id = ?",
+                    (row["id"],),
+                ).fetchall()
+                m["price_history"] = [{"t": h["t"], "p": h["p"]} for h in history]
+                markets.append(m)
+
+        # Mock estimator — LLM cost increases cumulatively: 0.03, then 0.07
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_estimator = MagicMock()
+            mock_estimate = MagicMock()
+            mock_estimate.final_estimate = 0.70
+            mock_estimate.confidence_low = 0.60
+            mock_estimate.confidence_high = 0.80
+            mock_estimate.thesis = "Test"
+            mock_estimator.estimate.return_value = mock_estimate
+            mock_est_cls.return_value = mock_estimator
+
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm = MagicMock()
+                # Simulate cumulative cost: 0.03 after trial 1, 0.07 after trial 2
+                mock_llm.get_usage_summary.side_effect = [
+                    {"estimated_cost": 0.03},
+                    {"estimated_cost": 0.07},
+                ]
+                mock_llm_cls.return_value = mock_llm
+
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB)
+
+        # Per-trial costs should be deltas: 0.03 and 0.04
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            trials = conn.execute(
+                "SELECT llm_cost FROM bt_simulation_trials WHERE run_id = ? ORDER BY id",
+                (result["run_id"],),
+            ).fetchall()
+
+        costs = [t["llm_cost"] for t in trials]
+        assert len(costs) == 2
+        assert abs(costs[0] - 0.03) < 0.001
+        assert abs(costs[1] - 0.04) < 0.001
+
+        # Run-level total should equal sum of deltas
+        assert abs(result["total_cost"] - 0.07) < 0.001

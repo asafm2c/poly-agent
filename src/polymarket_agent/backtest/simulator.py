@@ -428,6 +428,8 @@ def run_simulation(
     valid_trials = 0
     start_time = time.time()
 
+    prev_cumulative_cost = 0.0
+
     for i, market_dict in enumerate(markets):
         trial_start = time.time()
 
@@ -473,10 +475,11 @@ def run_simulation(
                 edge_threshold=edge_threshold, bankroll=bankroll, fee_rate=fee_rate,
             )
 
-        # LLM cost
-        trial_cost = 0.0
+        # LLM cost (delta from previous cumulative)
         usage = llm.get_usage_summary()
-        trial_cost = usage.get("estimated_cost", 0.0)
+        cumulative_cost = usage.get("estimated_cost", 0.0)
+        trial_cost = cumulative_cost - prev_cumulative_cost
+        prev_cumulative_cost = cumulative_cost
 
         trial_duration = int((time.time() - trial_start) * 1000)
 
@@ -505,7 +508,7 @@ def run_simulation(
         total_market_brier += market_brier
         if trade:
             total_pnl += trade["net_pnl"]
-        total_cost = trial_cost  # Cumulative from LLM client
+        total_cost += trial_cost
 
         # Progress logging
         processed = i + 1
