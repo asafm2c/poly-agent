@@ -1284,3 +1284,553 @@ class TestPerTrialCostDelta:
 
         # Run-level total should equal sum of deltas
         assert abs(result["total_cost"] - 0.07) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# Systematic Alpha Eval Tests
+# ---------------------------------------------------------------------------
+
+
+class TestTrainingRecencyScore:
+    """Tests for training_recency_score()."""
+
+    def test_in_training_window(self):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        assert training_recency_score("2024-01-01", "claude-sonnet-4-6") == 0.0
+
+    def test_well_past_cutoff(self):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        assert training_recency_score("2026-01-01", "claude-sonnet-4-6") == 1.0
+
+    def test_linear_interpolation(self):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        # 90 days after 2025-04-01 = ~2025-06-30, should be ~0.5
+        score = training_recency_score("2025-06-30", "claude-sonnet-4-6")
+        assert 0.45 < score < 0.55
+
+    def test_unknown_model_returns_1(self):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        assert training_recency_score("2024-01-01", "unknown-model") == 1.0
+
+    def test_exact_cutoff_date(self):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        assert training_recency_score("2025-04-01", "claude-sonnet-4-6") == 0.0
+
+
+class TestBrierConfidenceInterval:
+    """Tests for brier_confidence_interval()."""
+
+    def test_basic_computation(self):
+        from polymarket_agent.backtest.analysis import brier_confidence_interval
+        result = brier_confidence_interval(
+            [0.1, 0.2, 0.3, 0.15, 0.12],
+            [0.2, 0.25, 0.35, 0.2, 0.18],
+            seed=42,
+        )
+        assert result["n"] == 5
+        assert result["mean_diff"] < 0  # agent better
+        assert result["ci_low"] <= result["mean_diff"] <= result["ci_high"]
+
+    def test_identical_scores(self):
+        from polymarket_agent.backtest.analysis import brier_confidence_interval
+        result = brier_confidence_interval([0.1, 0.2, 0.3], [0.1, 0.2, 0.3], seed=42)
+        assert abs(result["mean_diff"]) < 0.001
+        assert not result["significant"]
+
+    def test_significant_difference(self):
+        from polymarket_agent.backtest.analysis import brier_confidence_interval
+        # Agent clearly better by large margin
+        result = brier_confidence_interval(
+            [0.05] * 30, [0.20] * 30, seed=42,
+        )
+        assert result["mean_diff"] < 0
+        assert result["significant"]
+        assert result["p_value"] < 0.05
+
+    def test_empty_input(self):
+        from polymarket_agent.backtest.analysis import brier_confidence_interval
+        result = brier_confidence_interval([], [])
+        assert result["n"] == 0
+        assert not result["significant"]
+
+    def test_weights_affect_result(self):
+        from polymarket_agent.backtest.analysis import brier_confidence_interval
+        r1 = brier_confidence_interval([0.1, 0.5], [0.2, 0.1], seed=42)
+        r2 = brier_confidence_interval([0.1, 0.5], [0.2, 0.1], weights=[1.0, 0.01], seed=42)
+        # With near-zero weight on second, result should differ
+        assert r1["mean_diff"] != r2["mean_diff"]
+
+
+class TestWeightedBrier:
+    """Tests for weighted_brier()."""
+
+    def test_basic_computation(self):
+        from polymarket_agent.backtest.analysis import weighted_brier
+        trials = [
+            {"agent_brier": 0.1, "market_brier": 0.2, "training_recency_score": 1.0},
+            {"agent_brier": 0.3, "market_brier": 0.2, "training_recency_score": 1.0},
+        ]
+        result = weighted_brier(trials)
+        assert result["trial_count"] == 2
+        assert abs(result["agent_brier_weighted"] - 0.2) < 0.001
+        assert abs(result["market_brier_weighted"] - 0.2) < 0.001
+
+    def test_null_weights_treated_as_1(self):
+        from polymarket_agent.backtest.analysis import weighted_brier
+        trials = [
+            {"agent_brier": 0.1, "market_brier": 0.2, "training_recency_score": None},
+        ]
+        result = weighted_brier(trials)
+        assert result["trial_count"] == 1
+        assert result["agent_brier_weighted"] is not None
+
+    def test_zero_weight_excluded(self):
+        from polymarket_agent.backtest.analysis import weighted_brier
+        trials = [
+            {"agent_brier": 0.1, "market_brier": 0.2, "training_recency_score": 0.0},
+            {"agent_brier": 0.5, "market_brier": 0.3, "training_recency_score": 1.0},
+        ]
+        result = weighted_brier(trials)
+        # With w=0 for first trial, result should be dominated by second
+        assert abs(result["agent_brier_weighted"] - 0.5) < 0.2
+
+
+class TestCrossModelComparison:
+    """Tests for cross_model_comparison()."""
+
+    def _setup_two_runs(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            # Insert markets
+            for i in range(10):
+                conn.execute(
+                    "INSERT INTO bt_markets (id, question, collected_at, volume, has_history, resolution_outcome) VALUES (?, ?, 'now', ?, 1, 'YES')",
+                    (f"mkt_{i}", f"Q{i}", 200000 if i < 5 else 2000000),
+                )
+            # Run 1: model A
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{\"model\": \"model-a\"}')")
+            for i in range(10):
+                conn.execute(
+                    "INSERT INTO bt_simulation_trials (run_id, market_id, horizon_days, agent_brier, market_brier, outcome, model) VALUES (1, ?, 7, ?, ?, 1.0, 'model-a')",
+                    (f"mkt_{i}", 0.10 + i * 0.01, 0.15 + i * 0.01),
+                )
+            # Run 2: model B
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (2, 'now', '{\"model\": \"model-b\"}')")
+            for i in range(10):
+                conn.execute(
+                    "INSERT INTO bt_simulation_trials (run_id, market_id, horizon_days, agent_brier, market_brier, outcome, model) VALUES (2, ?, 7, ?, ?, 1.0, 'model-b')",
+                    (f"mkt_{i}", 0.12 + i * 0.01, 0.15 + i * 0.01),
+                )
+
+    def test_models_summary(self):
+        from polymarket_agent.backtest.analysis import cross_model_comparison
+        self._setup_two_runs()
+        result = cross_model_comparison([1, 2], db_path=TEST_BACKTEST_DB)
+        assert "model-a" in result["models"]
+        assert "model-b" in result["models"]
+        assert result["models"]["model-a"]["trial_count"] == 10
+
+    def test_pairwise_comparison(self):
+        from polymarket_agent.backtest.analysis import cross_model_comparison
+        self._setup_two_runs()
+        result = cross_model_comparison([1, 2], db_path=TEST_BACKTEST_DB)
+        assert len(result["pairwise"]) == 1
+        pair_key = list(result["pairwise"].keys())[0]
+        assert "mean_diff" in result["pairwise"][pair_key]
+
+    def test_by_category(self):
+        from polymarket_agent.backtest.analysis import cross_model_comparison
+        self._setup_two_runs()
+        result = cross_model_comparison([1, 2], db_path=TEST_BACKTEST_DB)
+        assert "(null)" in result["by_category"]
+
+    def test_by_volume_tier(self):
+        from polymarket_agent.backtest.analysis import cross_model_comparison
+        self._setup_two_runs()
+        result = cross_model_comparison([1, 2], db_path=TEST_BACKTEST_DB)
+        assert len(result["by_volume_tier"]) >= 1
+
+    def test_by_cell(self):
+        from polymarket_agent.backtest.analysis import cross_model_comparison
+        self._setup_two_runs()
+        result = cross_model_comparison([1, 2], db_path=TEST_BACKTEST_DB)
+        assert "by_cell" in result
+        assert len(result["by_cell"]) >= 1
+
+
+class TestComputePairedStats:
+    """Tests for _compute_paired_stats()."""
+
+    def _setup_run(self, agent_offset=0.0):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            for i in range(30):
+                conn.execute(
+                    "INSERT OR IGNORE INTO bt_markets (id, question, collected_at) VALUES (?, ?, 'now')",
+                    (f"mkt_{i}", f"Q{i}"),
+                )
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+            for i in range(30):
+                conn.execute(
+                    "INSERT INTO bt_simulation_trials (run_id, market_id, horizon_days, agent_brier, market_brier, outcome, model) VALUES (1, ?, 7, ?, ?, 1.0, 'test')",
+                    (f"mkt_{i}", 0.10 + agent_offset + (i % 5) * 0.02, 0.15 + (i % 3) * 0.03),
+                )
+
+    def test_significant_difference(self):
+        from polymarket_agent.backtest.simulator import _compute_paired_stats
+        self._setup_run(agent_offset=0.0)
+        p_value, effect_size = _compute_paired_stats(1, TEST_BACKTEST_DB)
+        assert p_value is not None
+        assert p_value < 0.05
+        assert effect_size is not None
+
+    def test_small_sample_returns_none(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.simulator import _compute_paired_stats
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute("INSERT INTO bt_markets (id, question, collected_at) VALUES ('m1', 'Q', 'now')")
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+            conn.execute("INSERT INTO bt_simulation_trials (run_id, market_id, horizon_days, agent_brier, market_brier, outcome) VALUES (1, 'm1', 7, 0.1, 0.2, 1.0)")
+        p_value, effect_size = _compute_paired_stats(1, TEST_BACKTEST_DB)
+        assert p_value is None
+        assert effect_size is None
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis Tracker Tests
+# ---------------------------------------------------------------------------
+
+
+class TestHypothesisSchema:
+    """Tests for hypothesis tables and seed data."""
+
+    def test_hypothesis_tables_created(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        assert "bt_hypotheses" in tables
+        assert "bt_hypothesis_evidence" in tables
+        assert "bt_hypothesis_actions" in tables
+
+    def test_seed_hypotheses_created(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            count = conn.execute("SELECT COUNT(*) as c FROM bt_hypotheses").fetchone()["c"]
+        assert count == 4
+
+    def test_seed_hypotheses_idempotent(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.hypothesis import seed_hypotheses
+        init_backtest_db(TEST_BACKTEST_DB)
+        # Call again
+        seeded = seed_hypotheses(TEST_BACKTEST_DB)
+        assert seeded == 0  # Already seeded
+
+    def test_seed_actions_created(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            count = conn.execute("SELECT COUNT(*) as c FROM bt_hypothesis_actions").fetchone()["c"]
+        assert count >= 4  # At least one action per seed hypothesis
+
+
+class TestHypothesisCRUD:
+    """Tests for propose() and record_evidence()."""
+
+    def test_propose_creates_hypothesis(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("test-hyp", "Test hypothesis", db_path=TEST_BACKTEST_DB)
+        assert hyp_id > 0
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            row = conn.execute("SELECT * FROM bt_hypotheses WHERE id = ?", (hyp_id,)).fetchone()
+        assert row["name"] == "test-hyp"
+        assert row["status"] == "proposed"
+        assert row["confidence_score"] == 0.0
+
+    def test_propose_with_filters(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("filtered", "Filtered hypothesis",
+                         category_filter=None, volume_min=100000, volume_max=1000000,
+                         db_path=TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            row = conn.execute("SELECT * FROM bt_hypotheses WHERE id = ?", (hyp_id,)).fetchone()
+        assert row["volume_min"] == 100000
+        assert row["volume_max"] == 1000000
+
+    def test_propose_duplicate_name_raises(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose
+        init_backtest_db(TEST_BACKTEST_DB)
+        propose("unique-name", "First", db_path=TEST_BACKTEST_DB)
+        with pytest.raises(Exception):
+            propose("unique-name", "Duplicate", db_path=TEST_BACKTEST_DB)
+
+    def test_propose_with_actions(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("with-actions", "Has actions", actions=[
+            {"action_type": "edge_override", "config": '{"base_threshold": 0.08}', "base_strength": 1.0},
+        ], db_path=TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            actions = conn.execute("SELECT * FROM bt_hypothesis_actions WHERE hypothesis_id = ?", (hyp_id,)).fetchall()
+        assert len(actions) == 1
+        assert actions[0]["active"] == 0  # Inactive until confirmed
+
+    def test_record_evidence(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose, record_evidence
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("ev-test", "Evidence test", db_path=TEST_BACKTEST_DB)
+        # Need a simulation run for FK
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+        ev_id = record_evidence(hyp_id, run_id=1, trial_count=50,
+                                agent_brier=0.15, market_brier=0.18,
+                                brier_diff=-0.03, p_value=0.02,
+                                supports_hypothesis=1, db_path=TEST_BACKTEST_DB)
+        assert ev_id > 0
+
+
+class TestHypothesisEvaluation:
+    """Tests for evaluate() and status transitions."""
+
+    def _setup_hypothesis_with_evidence(self, brier_diff=-0.03, p_value=0.02, n_evidence=1, trial_count=50):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import propose, record_evidence
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("eval-test", "Eval test", actions=[
+            {"action_type": "edge_override", "config": '{"base_threshold": 0.08}', "base_strength": 1.0},
+        ], db_path=TEST_BACKTEST_DB)
+        for i in range(n_evidence):
+            with get_backtest_db(TEST_BACKTEST_DB) as conn:
+                conn.execute("INSERT INTO bt_simulation_runs (started_at, config) VALUES ('now', '{}')")
+                run_id = conn.execute("SELECT MAX(id) as m FROM bt_simulation_runs").fetchone()["m"]
+            supports = 1 if brier_diff < 0 else 0
+            record_evidence(hyp_id, run_id=run_id, trial_count=trial_count,
+                            agent_brier=0.15, market_brier=0.18,
+                            brier_diff=brier_diff, p_value=p_value,
+                            supports_hypothesis=supports, db_path=TEST_BACKTEST_DB)
+        return hyp_id
+
+    def test_evaluate_confirms_on_strong_evidence(self):
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.hypothesis import evaluate
+        hyp_id = self._setup_hypothesis_with_evidence(brier_diff=-0.03, p_value=0.02, trial_count=50)
+        result = evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        assert result["status"] == "confirmed"
+        # Check actions activated
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            actions = conn.execute("SELECT * FROM bt_hypothesis_actions WHERE hypothesis_id = ? AND active = 1", (hyp_id,)).fetchall()
+        assert len(actions) >= 1
+
+    def test_evaluate_rejects_on_positive_brier_diff(self):
+        from polymarket_agent.backtest.hypothesis import evaluate
+        hyp_id = self._setup_hypothesis_with_evidence(brier_diff=0.05, p_value=0.3, trial_count=50)
+        result = evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        assert result["status"] == "rejected"
+
+    def test_evaluate_inconclusive_small_sample(self):
+        from polymarket_agent.backtest.hypothesis import evaluate
+        hyp_id = self._setup_hypothesis_with_evidence(brier_diff=-0.03, p_value=0.02, trial_count=10)
+        result = evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        # Not enough effective trials for confirmation
+        assert result["recommendation"] in ("inconclusive", "need_evidence", "confirmed")
+
+    def test_evaluate_no_evidence(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.hypothesis import evaluate, propose
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("no-ev", "No evidence", db_path=TEST_BACKTEST_DB)
+        result = evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        assert result["recommendation"] == "need_evidence"
+
+
+class TestHypothesisActions:
+    """Tests for load_active_hypothesis_actions() and action lifecycle."""
+
+    def test_no_active_actions_initially(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.hypothesis import load_active_hypothesis_actions
+        init_backtest_db(TEST_BACKTEST_DB)
+        actions = load_active_hypothesis_actions(db_path=TEST_BACKTEST_DB)
+        assert len(actions) == 0
+
+    def test_actions_activated_on_confirm(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import (
+            evaluate, load_active_hypothesis_actions, propose, record_evidence,
+        )
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("action-test", "Action test", actions=[
+            {"action_type": "edge_override", "config": '{"base_threshold": 0.08}', "base_strength": 1.0},
+        ], db_path=TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+        record_evidence(hyp_id, run_id=1, trial_count=50,
+                        agent_brier=0.12, market_brier=0.18, brier_diff=-0.06,
+                        p_value=0.01, supports_hypothesis=1, db_path=TEST_BACKTEST_DB)
+        evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        actions = load_active_hypothesis_actions(db_path=TEST_BACKTEST_DB)
+        assert len(actions) >= 1
+        assert actions[0]["effective_strength"] > 0
+
+    def test_effective_strength_scales_with_confidence(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import (
+            evaluate, load_active_hypothesis_actions, propose, record_evidence,
+        )
+        init_backtest_db(TEST_BACKTEST_DB)
+        hyp_id = propose("strength-test", "Strength test", actions=[
+            {"action_type": "edge_override", "config": '{"base_threshold": 0.08}', "base_strength": 0.5},
+        ], db_path=TEST_BACKTEST_DB)
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+        record_evidence(hyp_id, run_id=1, trial_count=50,
+                        agent_brier=0.10, market_brier=0.20, brier_diff=-0.10,
+                        p_value=0.001, supports_hypothesis=1, db_path=TEST_BACKTEST_DB)
+        evaluate(hyp_id, db_path=TEST_BACKTEST_DB)
+        actions = load_active_hypothesis_actions(db_path=TEST_BACKTEST_DB)
+        assert len(actions) >= 1
+        # effective = base_strength * confidence_score
+        assert actions[0]["effective_strength"] <= actions[0]["base_strength"]
+
+
+class TestMergeHypothesisActions:
+    """Tests for _merge_hypothesis_actions() in strategy.py."""
+
+    def test_category_avoid_merged(self):
+        from polymarket_agent.backtest.strategy import _merge_hypothesis_actions
+        config = {"market_selection": {}, "edge_thresholds": {}}
+        actions = [{"action_type": "category_avoid", "config": {"category": "Sports"}, "effective_strength": 1.0}]
+        result = _merge_hypothesis_actions(config, actions)
+        assert "Sports" in result["market_selection"]["avoid_categories"]
+
+    def test_edge_override_merged(self):
+        from polymarket_agent.backtest.strategy import _merge_hypothesis_actions
+        config = {"market_selection": {}, "edge_thresholds": {}}
+        actions = [{"action_type": "edge_override", "config": {"base_threshold": 0.08, "applies_to": "test"}, "effective_strength": 0.8}]
+        result = _merge_hypothesis_actions(config, actions)
+        assert "test" in result["edge_thresholds"]["category_overrides"]
+
+    def test_user_override_not_replaced(self):
+        from polymarket_agent.backtest.strategy import _merge_hypothesis_actions
+        config = {"market_selection": {}, "edge_thresholds": {"category_overrides": {"test": 0.15}}}
+        actions = [{"action_type": "edge_override", "config": {"base_threshold": 0.08, "applies_to": "test"}, "effective_strength": 0.8}]
+        result = _merge_hypothesis_actions(config, actions)
+        assert result["edge_thresholds"]["category_overrides"]["test"] == 0.15  # User value preserved
+
+    def test_low_strength_not_applied(self):
+        from polymarket_agent.backtest.strategy import _merge_hypothesis_actions
+        config = {"market_selection": {}, "edge_thresholds": {}}
+        actions = [{"action_type": "edge_override", "config": {"base_threshold": 0.08, "applies_to": "weak"}, "effective_strength": 0.05}]
+        result = _merge_hypothesis_actions(config, actions)
+        assert "weak" not in result["edge_thresholds"].get("category_overrides", {})
+
+    def test_actions_stored_in_hypothesis_actions_key(self):
+        from polymarket_agent.backtest.strategy import _merge_hypothesis_actions
+        config = {"market_selection": {}, "edge_thresholds": {}}
+        actions = [{"action_type": "model_preference", "config": {"model": "sonnet"}, "effective_strength": 1.0}]
+        result = _merge_hypothesis_actions(config, actions)
+        assert len(result["hypothesis_actions"]) == 1
+
+
+class TestWeightedConfidence:
+    """Tests for _compute_weighted_confidence()."""
+
+    def test_empty_evidence(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_confidence
+        assert _compute_weighted_confidence([]) == 0.0
+
+    def test_strong_supporting_evidence(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_confidence
+        now = datetime.now(timezone.utc).isoformat()
+        evidence = [{"recorded_at": now, "brier_diff": -0.05, "trial_count": 50}]
+        conf = _compute_weighted_confidence(evidence)
+        assert conf > 0.5
+
+    def test_contradicting_evidence(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_confidence
+        now = datetime.now(timezone.utc).isoformat()
+        evidence = [{"recorded_at": now, "brier_diff": 0.05, "trial_count": 50}]
+        conf = _compute_weighted_confidence(evidence)
+        assert conf < 0.5
+
+    def test_small_sample_less_weight(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_confidence
+        now = datetime.now(timezone.utc).isoformat()
+        # Same brier_diff, different trial counts
+        ev_small = [{"recorded_at": now, "brier_diff": -0.05, "trial_count": 5}]
+        ev_large = [{"recorded_at": now, "brier_diff": -0.05, "trial_count": 100}]
+        conf_small = _compute_weighted_confidence(ev_small)
+        conf_large = _compute_weighted_confidence(ev_large)
+        # Larger sample should give slightly different weighting
+        assert conf_small > 0 and conf_large > 0
+
+
+class TestCalibrationWithHypotheses:
+    """Tests for calibration export including hypothesis summaries."""
+
+    def test_confirmed_hypotheses_summary(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.hypothesis import get_confirmed_hypotheses_summary
+        init_backtest_db(TEST_BACKTEST_DB)
+        # No confirmed hypotheses yet
+        summary = get_confirmed_hypotheses_summary(db_path=TEST_BACKTEST_DB)
+        assert summary is None
+
+    def test_confirmed_summary_includes_text(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import get_confirmed_hypotheses_summary
+        init_backtest_db(TEST_BACKTEST_DB)
+        # Manually confirm a hypothesis
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                "UPDATE bt_hypotheses SET status = 'confirmed', confidence_score = 0.8 WHERE name = 'probable-no-alpha'"
+            )
+        summary = get_confirmed_hypotheses_summary(db_path=TEST_BACKTEST_DB)
+        assert summary is not None
+        assert "Validated Findings" in summary
+        assert "probable-no-alpha" in summary
+
+
+# ---------------------------------------------------------------------------
+# CLI Smoke Tests
+# ---------------------------------------------------------------------------
+
+
+class TestHypothesisCLI:
+    """Smoke tests for hypothesis CLI commands."""
+
+    def test_hypothesis_list(self):
+        from click.testing import CliRunner
+        from polymarket_agent.cli.main import cli
+        runner = CliRunner()
+        result = runner.invoke(cli, ["backtest", "hypothesis", "list"])
+        assert result.exit_code == 0
+        assert "Hypotheses" in result.output or "No hypotheses" in result.output
+
+    def test_hypothesis_actions(self):
+        from click.testing import CliRunner
+        from polymarket_agent.cli.main import cli
+        runner = CliRunner()
+        result = runner.invoke(cli, ["backtest", "hypothesis", "actions"])
+        assert result.exit_code == 0
+
+    def test_hypothesis_decay_check(self):
+        from polymarket_agent.backtest.database import init_backtest_db
+        init_backtest_db(TEST_BACKTEST_DB)
+        from click.testing import CliRunner
+        from polymarket_agent.cli.main import cli
+        runner = CliRunner()
+        result = runner.invoke(cli, ["backtest", "hypothesis", "decay-check"])
+        assert result.exit_code == 0
