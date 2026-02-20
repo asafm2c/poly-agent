@@ -49,10 +49,61 @@ def load_strategy_config(path: Path | None = None) -> dict:
         if not isinstance(config, dict):
             logger.warning("Invalid strategy config format, using defaults")
             return dict(DEFAULT_CONFIG)
-        return config
     except Exception as e:
         logger.error("Failed to load strategy config: %s", e)
         return dict(DEFAULT_CONFIG)
+
+    # Merge hypothesis-driven actions
+    try:
+        from polymarket_agent.backtest.hypothesis import load_active_hypothesis_actions
+        actions = load_active_hypothesis_actions()
+        if actions:
+            config = _merge_hypothesis_actions(config, actions)
+    except Exception as e:
+        logger.debug("Hypothesis action merge skipped: %s", e)
+
+    return config
+
+
+def _merge_hypothesis_actions(config: dict, actions: list[dict]) -> dict:
+    """Merge active hypothesis actions into strategy config.
+
+    Does not override user-set values.
+    """
+    ms = config.setdefault("market_selection", {})
+    et = config.setdefault("edge_thresholds", {})
+    ha = config.setdefault("hypothesis_actions", [])
+
+    for action in actions:
+        atype = action["action_type"]
+        cfg = action["config"]
+        strength = action["effective_strength"]
+
+        if atype == "category_target":
+            targets = ms.setdefault("target_categories", [])
+            cat = cfg.get("category")
+            if cat and cat not in targets:
+                targets.append(cat)
+
+        elif atype == "category_avoid":
+            avoids = ms.setdefault("avoid_categories", [])
+            cat = cfg.get("category")
+            if cat and cat not in avoids:
+                avoids.append(cat)
+
+        elif atype == "edge_override":
+            overrides = et.setdefault("category_overrides", {})
+            applies_to = cfg.get("applies_to", "default")
+            base_thresh = cfg.get("base_threshold", 0.10)
+            if strength > 0.1:  # Minimum strength to apply
+                effective = base_thresh * (1.0 + (1.0 - strength) * 0.5)
+                if applies_to not in overrides:  # Don't override user-set values
+                    overrides[applies_to] = round(effective, 4)
+
+        # Store all actions for downstream consumers
+        ha.append(action)
+
+    return config
 
 
 def create_default_strategy_config(path: Path | None = None) -> Path:

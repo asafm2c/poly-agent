@@ -629,3 +629,23 @@ class AgentScheduler:
                     )
                 else:
                     logger.info("Strategy aligned: %s Brier=%.4f", cat, brier)
+
+        # Cross-reference confirmed hypotheses
+        try:
+            from polymarket_agent.backtest.hypothesis import load_confirmed_hypotheses
+            hypotheses = load_confirmed_hypotheses()
+            for hyp in hypotheses:
+                cat = hyp.get("category_filter")
+                if cat and cat in {row["category"] for row in rows}:
+                    matching = [r for r in rows if r["category"] == cat]
+                    if matching:
+                        live_brier = matching[0]["brier"]
+                        live_count = matching[0]["count"]
+                        if live_count >= 20 and live_brier > 0.25:
+                            logger.warning(
+                                "Hypothesis '%s' may be invalid: live Brier=%.4f "
+                                "on %d predictions (expected agent advantage)",
+                                hyp["name"], live_brier, live_count,
+                            )
+        except Exception as e:
+            logger.debug("Hypothesis cross-reference skipped: %s", e)

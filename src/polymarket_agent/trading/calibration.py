@@ -204,6 +204,16 @@ def export_calibration_for_llm(min_resolved: int = 20) -> str:
                     f"({cat_report.resolved_predictions} predictions)"
                 )
 
+    # Hypothesis awareness
+    try:
+        from polymarket_agent.backtest.hypothesis import get_confirmed_hypotheses_summary
+        hyp_text = get_confirmed_hypotheses_summary()
+        if hyp_text:
+            lines.append("")
+            lines.append(hyp_text)
+    except Exception:
+        pass  # Hypothesis system not yet initialized
+
     return "\n".join(lines)
 
 

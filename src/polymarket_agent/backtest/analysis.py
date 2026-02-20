@@ -4,7 +4,9 @@ All functions accept standard Python arguments and return structured dicts/lists
 Callable from CLI, notebooks, LLM agents, or scripts.
 """
 
+import json
 import logging
+import random as _random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +14,13 @@ from polymarket_agent.backtest.database import get_backtest_db, REGIMES
 from polymarket_agent.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Model training cutoff dates (best-guess knowledge cutoffs)
+MODEL_TRAINING_CUTOFFS = {
+    "claude-haiku-4-5-20251001": "2025-04-01",
+    "claude-sonnet-4-6": "2025-04-01",
+    "claude-opus-4-6": "2025-04-01",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +579,325 @@ def _parse_outcome(resolution_outcome: str | None) -> float | None:
     elif outcome_upper in ("NO", "0", "0.0", "FALSE"):
         return 0.0
     return None
+
+
+# ---------------------------------------------------------------------------
+# Training Recency & Temporal Confidence
+# ---------------------------------------------------------------------------
+
+
+def training_recency_score(resolution_date: str, model: str) -> float:
+    """Compute training recency score (0.0 = in training window, 1.0 = clean).
+
+    Linear interpolation from 0.0 to 1.0 over 180 days past the model's
+    training cutoff date. Returns 1.0 for unknown models.
+    """
+    cutoff_str = MODEL_TRAINING_CUTOFFS.get(model)
+    if cutoff_str is None:
+        return 1.0
+
+    try:
+        # Parse dates (handle various formats)
+        res_str = resolution_date[:10]
+        cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d")
+        res_dt = datetime.strptime(res_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return 1.0
+
+    days_after = (res_dt - cutoff_dt).days
+
+    if days_after <= 0:
+        return 0.0
+    elif days_after >= 180:
+        return 1.0
+    else:
+        return days_after / 180.0
+
+
+def weighted_brier(
+    trials: list[dict],
+    weight_key: str = "training_recency_score",
+) -> dict:
+    """Compute weighted mean Brier score using per-trial weights.
+
+    Returns {"agent_brier_weighted", "market_brier_weighted",
+             "brier_diff_weighted", "total_weight", "trial_count"}.
+    """
+    total_w_agent = 0.0
+    total_w_market = 0.0
+    total_weight = 0.0
+    count = 0
+
+    for t in trials:
+        ab = t.get("agent_brier") if isinstance(t, dict) else t["agent_brier"]
+        mb = t.get("market_brier") if isinstance(t, dict) else t["market_brier"]
+        if ab is None or mb is None:
+            continue
+
+        w = t.get(weight_key) if isinstance(t, dict) else t[weight_key]
+        if w is None:
+            w = 1.0
+
+        total_w_agent += ab * w
+        total_w_market += mb * w
+        total_weight += w
+        count += 1
+
+    if total_weight == 0:
+        return {
+            "agent_brier_weighted": None,
+            "market_brier_weighted": None,
+            "brier_diff_weighted": None,
+            "total_weight": 0.0,
+            "trial_count": 0,
+        }
+
+    awb = total_w_agent / total_weight
+    mwb = total_w_market / total_weight
+    return {
+        "agent_brier_weighted": awb,
+        "market_brier_weighted": mwb,
+        "brier_diff_weighted": awb - mwb,
+        "total_weight": total_weight,
+        "trial_count": count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Statistical Comparison (Bootstrap)
+# ---------------------------------------------------------------------------
+
+
+def brier_confidence_interval(
+    agent_briers: list[float],
+    market_briers: list[float],
+    weights: list[float] | None = None,
+    n_bootstrap: int = 10_000,
+    confidence: float = 0.95,
+    seed: int | None = None,
+) -> dict:
+    """Bootstrap confidence interval on Brier score difference.
+
+    Computes paired differences (agent - market), bootstraps weighted mean.
+    Returns {"mean_diff", "ci_low", "ci_high", "p_value", "n", "significant"}.
+    """
+    n = len(agent_briers)
+    if n == 0:
+        return {"mean_diff": 0.0, "ci_low": 0.0, "ci_high": 0.0,
+                "p_value": 1.0, "n": 0, "significant": False}
+
+    diffs = [a - m for a, m in zip(agent_briers, market_briers)]
+    ws = weights or [1.0] * n
+
+    def _weighted_mean(vals, wts):
+        tw = sum(wts)
+        if tw == 0:
+            return 0.0
+        return sum(v * w for v, w in zip(vals, wts)) / tw
+
+    observed_mean = _weighted_mean(diffs, ws)
+
+    rng = _random.Random(seed)
+    bootstrap_means = []
+    indices = list(range(n))
+    for _ in range(n_bootstrap):
+        sample_idx = rng.choices(indices, k=n)
+        sample_diffs = [diffs[i] for i in sample_idx]
+        sample_weights = [ws[i] for i in sample_idx]
+        bootstrap_means.append(_weighted_mean(sample_diffs, sample_weights))
+
+    bootstrap_means.sort()
+    alpha = 1 - confidence
+    ci_low = bootstrap_means[int(alpha / 2 * n_bootstrap)]
+    ci_high = bootstrap_means[int((1 - alpha / 2) * n_bootstrap)]
+
+    # Two-sided p-value
+    if observed_mean < 0:
+        p_value = sum(1 for b in bootstrap_means if b >= 0) / n_bootstrap
+    else:
+        p_value = sum(1 for b in bootstrap_means if b <= 0) / n_bootstrap
+
+    significant = p_value < alpha
+
+    return {
+        "mean_diff": observed_mean,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "p_value": p_value,
+        "n": n,
+        "significant": significant,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-Model Comparison
+# ---------------------------------------------------------------------------
+
+
+def _volume_tier(vol: float) -> str:
+    """Classify volume into tier."""
+    if vol >= 10_000_000:
+        return ">10M"
+    elif vol >= 1_000_000:
+        return "1M-10M"
+    elif vol >= 100_000:
+        return "100K-1M"
+    return "10K-100K"
+
+
+def cross_model_comparison(
+    run_ids: list[int],
+    db_path: Path | None = None,
+) -> dict:
+    """Compare Brier scores across simulation runs (typically different models).
+
+    Returns {"models": {model: summary}, "pairwise": {...},
+             "by_category": {...}, "by_volume_tier": {...}, "by_cell": {...}}.
+    """
+    path = db_path or settings.backtest_db_path
+
+    # Load all trials with market metadata
+    runs_data = {}
+    with get_backtest_db(path) as conn:
+        for run_id in run_ids:
+            run_row = conn.execute(
+                "SELECT * FROM bt_simulation_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if not run_row:
+                continue
+
+            trials = conn.execute(
+                """SELECT t.*, m.category, m.volume
+                FROM bt_simulation_trials t
+                JOIN bt_markets m ON t.market_id = m.id
+                WHERE t.run_id = ?""",
+                (run_id,),
+            ).fetchall()
+
+            model = None
+            if run_row["config"]:
+                try:
+                    cfg = json.loads(run_row["config"])
+                    model = cfg.get("model")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Check trial-level model
+            if model is None and trials:
+                model = trials[0]["model"]
+
+            model = model or f"run_{run_id}"
+            runs_data[model] = {
+                "run_id": run_id,
+                "trials": [dict(t) for t in trials],
+            }
+
+    if not runs_data:
+        return {}
+
+    # Per-model aggregates
+    models_summary = {}
+    for model, data in runs_data.items():
+        trials = data["trials"]
+        valid = [t for t in trials if t.get("agent_brier") is not None]
+        if not valid:
+            continue
+
+        ab_list = [t["agent_brier"] for t in valid]
+        mb_list = [t["market_brier"] for t in valid if t.get("market_brier") is not None]
+
+        avg_ab = sum(ab_list) / len(ab_list) if ab_list else None
+        avg_mb = sum(mb_list) / len(mb_list) if mb_list else None
+
+        wb = weighted_brier(valid)
+
+        models_summary[model] = {
+            "run_id": data["run_id"],
+            "agent_brier": avg_ab,
+            "market_brier": avg_mb,
+            "brier_diff": (avg_ab - avg_mb) if avg_ab is not None and avg_mb is not None else None,
+            "weighted": wb,
+            "trial_count": len(valid),
+        }
+
+    # Pairwise comparisons (paired by market_id)
+    model_names = list(runs_data.keys())
+    pairwise = {}
+    for i in range(len(model_names)):
+        for j in range(i + 1, len(model_names)):
+            ma, mb_name = model_names[i], model_names[j]
+            trials_a = {t["market_id"]: t for t in runs_data[ma]["trials"] if t.get("agent_brier") is not None}
+            trials_b = {t["market_id"]: t for t in runs_data[mb_name]["trials"] if t.get("agent_brier") is not None}
+
+            shared_ids = set(trials_a.keys()) & set(trials_b.keys())
+            if len(shared_ids) < 5:
+                continue
+
+            a_briers = [trials_a[mid]["agent_brier"] for mid in shared_ids]
+            b_briers = [trials_b[mid]["agent_brier"] for mid in shared_ids]
+
+            ci = brier_confidence_interval(a_briers, b_briers)
+            pairwise[f"{ma} vs {mb_name}"] = ci
+
+    # Per-category breakdown
+    by_category = {}
+    for model, data in runs_data.items():
+        for t in data["trials"]:
+            if t.get("agent_brier") is None:
+                continue
+            cat = t.get("category") or "(null)"
+            if cat not in by_category:
+                by_category[cat] = {}
+            if model not in by_category[cat]:
+                by_category[cat][model] = {"ab_sum": 0.0, "mb_sum": 0.0, "n": 0}
+            by_category[cat][model]["ab_sum"] += t["agent_brier"]
+            by_category[cat][model]["mb_sum"] += t.get("market_brier", 0)
+            by_category[cat][model]["n"] += 1
+
+    by_category_result = {}
+    for cat, models_in_cat in by_category.items():
+        by_category_result[cat] = {}
+        for model, agg in models_in_cat.items():
+            n = agg["n"]
+            by_category_result[cat][model] = {
+                "agent_brier": agg["ab_sum"] / n,
+                "market_brier": agg["mb_sum"] / n,
+                "brier_diff": (agg["ab_sum"] - agg["mb_sum"]) / n,
+                "n": n,
+                "sufficient": n >= 20,
+            }
+
+    # Per-volume-tier breakdown
+    by_tier = {}
+    for model, data in runs_data.items():
+        for t in data["trials"]:
+            if t.get("agent_brier") is None:
+                continue
+            tier = _volume_tier(t.get("volume", 0) or 0)
+            if tier not in by_tier:
+                by_tier[tier] = {}
+            if model not in by_tier[tier]:
+                by_tier[tier][model] = {"ab_sum": 0.0, "mb_sum": 0.0, "n": 0}
+            by_tier[tier][model]["ab_sum"] += t["agent_brier"]
+            by_tier[tier][model]["mb_sum"] += t.get("market_brier", 0)
+            by_tier[tier][model]["n"] += 1
+
+    by_tier_result = {}
+    for tier, models_in_tier in by_tier.items():
+        by_tier_result[tier] = {}
+        for model, agg in models_in_tier.items():
+            n = agg["n"]
+            by_tier_result[tier][model] = {
+                "agent_brier": agg["ab_sum"] / n,
+                "market_brier": agg["mb_sum"] / n,
+                "brier_diff": (agg["ab_sum"] - agg["mb_sum"]) / n,
+                "n": n,
+                "sufficient": n >= 20,
+            }
+
+    return {
+        "models": models_summary,
+        "pairwise": pairwise,
+        "by_category": by_category_result,
+        "by_volume_tier": by_tier_result,
+    }

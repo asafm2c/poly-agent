@@ -771,5 +771,450 @@ def show_results(run_id: int | None):
         console.print(vol_table)
 
 
+# ---------------------------------------------------------------------------
+# Model Aliases for evaluate command
+# ---------------------------------------------------------------------------
+
+MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+}
+
+
+def _resolve_model(name: str) -> str:
+    return MODEL_ALIASES.get(name.lower(), name)
+
+
+@backtest.command("evaluate")
+@click.option("--models", "-m", multiple=True,
+              help="Models to evaluate (haiku, sonnet, opus). Repeat for multiple.")
+@click.option("--trials-per-cell", type=int, default=20,
+              help="Minimum trials per category x volume cell (default: 20)")
+@click.option("--categories", multiple=True,
+              help="Categories to include (default: auto-discover). Use 'null' for null-category.")
+@click.option("--horizon", type=int, default=7, help="Days before resolution (default: 7)")
+@click.option("--budget", type=float, default=None, help="Maximum total LLM cost in USD")
+@click.option("--all-at-once", is_flag=True, help="Run all models without intermediate prompts")
+@click.option("--dry-run", is_flag=True, help="Preview market selection and cost estimate only")
+def evaluate_backtest(
+    models: tuple[str, ...],
+    trials_per_cell: int,
+    categories: tuple[str, ...],
+    horizon: int,
+    budget: float | None,
+    all_at_once: bool,
+    dry_run: bool,
+):
+    """Run multi-model evaluation with stratified sampling and statistical comparison."""
+    from polymarket_agent.backtest.simulator import (
+        MODEL_COST_PER_TRIAL,
+        select_markets_stratified,
+        run_multi_model_evaluation,
+    )
+
+    # Resolve model names
+    model_list = [_resolve_model(m) for m in models] if models else [
+        MODEL_ALIASES["haiku"], MODEL_ALIASES["sonnet"]
+    ]
+
+    # Resolve categories
+    cat_list = None
+    if categories:
+        cat_list = [None if c.lower() == "null" else c for c in categories]
+
+    # Select markets
+    with console.status("Selecting markets (stratified)..."):
+        markets, cell_counts = select_markets_stratified(
+            n_per_cell=trials_per_cell,
+            categories=cat_list,
+            horizon=horizon,
+        )
+
+    if not markets:
+        console.print("[red]No eligible markets found.[/]")
+        return
+
+    # Display plan
+    console.print(f"\n[bold]Evaluation Plan[/]")
+    console.print(f"  Horizon: {horizon} days")
+    console.print(f"  Trials per cell: {trials_per_cell}")
+    console.print(f"  Total markets: {len(markets)}")
+    console.print(f"  Cells: {len(cell_counts)}")
+
+    # Cell counts table
+    cell_table = Table(title="Market Selection by Cell")
+    cell_table.add_column("Category")
+    cell_table.add_column("Volume Tier")
+    cell_table.add_column("Available", justify="right")
+    cell_table.add_column("Selected", justify="right")
+    cell_table.add_column("Flag")
+
+    for (cat, tier), counts in sorted(cell_counts.items(), key=lambda x: (str(x[0][0]), x[0][1])):
+        flag = "[yellow]![/]" if counts["selected"] < trials_per_cell else ""
+        cell_table.add_row(
+            str(cat) if cat is not None else "(null)",
+            tier,
+            str(counts["available"]),
+            str(counts["selected"]),
+            flag,
+        )
+    console.print(cell_table)
+
+    # Cost estimate
+    cost_table = Table(title="Cost Estimate")
+    cost_table.add_column("Model")
+    cost_table.add_column("Cost/Trial", justify="right")
+    cost_table.add_column("Trials", justify="right")
+    cost_table.add_column("Estimated", justify="right")
+
+    total_est = 0.0
+    for m in model_list:
+        cpt = MODEL_COST_PER_TRIAL.get(m, 0.05)
+        est = len(markets) * cpt
+        total_est += est
+        short_name = next((k for k, v in MODEL_ALIASES.items() if v == m), m)
+        cost_table.add_row(short_name, f"${cpt:.3f}", str(len(markets)), f"${est:.2f}")
+
+    cost_table.add_row("[bold]Total[/]", "", "", f"[bold]${total_est:.2f}[/]")
+    console.print(cost_table)
+
+    if budget is not None:
+        if total_est <= budget:
+            console.print(f"Budget: ${budget:.2f} — [green]all models fit[/]")
+        else:
+            console.print(f"Budget: ${budget:.2f} — [yellow]some models may be skipped[/]")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run — no LLM calls made.[/]")
+        return
+
+    if not all_at_once:
+        if not click.confirm("\nProceed with evaluation?", default=True):
+            return
+
+    # Progress callback for progressive mode
+    def _progress_callback(model_name, result, comparison):
+        short = next((k for k, v in MODEL_ALIASES.items() if v == model_name), model_name)
+        console.print(f"\n[bold]--- {short.upper()} Results (Run #{result['run_id']}) ---[/]")
+        if result.get("agent_brier") is not None:
+            console.print(f"  Agent Brier: {result['agent_brier']:.4f}")
+        console.print(f"  Market Brier: {result['market_brier']:.4f}")
+        if result.get("brier_diff") is not None:
+            d = result["brier_diff"]
+            style = "green" if d < 0 else "red"
+            console.print(f"  Diff: [{style}]{d:+.4f}[/{style}]")
+        console.print(f"  Cost: ${result['total_cost']:.2f}")
+
+        if comparison and "pairwise" in comparison:
+            for pair, ci in comparison["pairwise"].items():
+                sig = "[bold]*significant*[/]" if ci["significant"] else ""
+                console.print(f"  {pair}: {ci['mean_diff']:+.4f} [{ci['ci_low']:+.4f}, {ci['ci_high']:+.4f}] {sig}")
+
+        if all_at_once:
+            return True
+        return click.confirm(f"\nContinue to next model?", default=True)
+
+    # Run evaluation
+    console.print("\nRunning multi-model evaluation...\n")
+    result = run_multi_model_evaluation(
+        markets=markets,
+        models=model_list,
+        horizon=horizon,
+        budget=budget,
+        progressive=not all_at_once,
+        progress_callback=_progress_callback if not all_at_once else None,
+    )
+
+    # Final report
+    comparison = result.get("comparison", {})
+    if comparison and "models" in comparison:
+        console.print(f"\n[bold]{'=' * 60}[/]")
+        console.print(f"[bold]Final Comparison Report[/]")
+
+        model_table = Table(title="Model Comparison")
+        model_table.add_column("Model")
+        model_table.add_column("Brier", justify="right")
+        model_table.add_column("vs Market", justify="right")
+        model_table.add_column("Trials", justify="right")
+
+        for m, summary in comparison["models"].items():
+            short = next((k for k, v in MODEL_ALIASES.items() if v == m), m)
+            diff_str = ""
+            if summary.get("brier_diff") is not None:
+                d = summary["brier_diff"]
+                diff_str = f"[{'green' if d < 0 else 'red'}]{d:+.4f}[/]"
+            model_table.add_row(
+                short,
+                f"{summary['agent_brier']:.4f}" if summary.get("agent_brier") else "N/A",
+                diff_str,
+                str(summary["trial_count"]),
+            )
+        console.print(model_table)
+
+        if comparison.get("pairwise"):
+            pair_table = Table(title="Pairwise Comparison")
+            pair_table.add_column("Comparison")
+            pair_table.add_column("Diff", justify="right")
+            pair_table.add_column("95% CI", justify="right")
+            pair_table.add_column("Sig?")
+
+            for pair, ci in comparison["pairwise"].items():
+                pair_table.add_row(
+                    pair,
+                    f"{ci['mean_diff']:+.4f}",
+                    f"[{ci['ci_low']:+.4f}, {ci['ci_high']:+.4f}]",
+                    "[green]Yes[/]" if ci["significant"] else "No",
+                )
+            console.print(pair_table)
+
+    console.print(f"\n[dim]Total spent: ${result.get('total_spent', 0):.2f}[/]")
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis CLI
+# ---------------------------------------------------------------------------
+
+
+@backtest.group()
+def hypothesis():
+    """Manage testable hypotheses about agent performance."""
+    pass
+
+
+@hypothesis.command("list")
+@click.option("--status", "-s", type=click.Choice(
+    ["proposed", "testing", "confirmed", "rejected", "invalidated", "all"]
+), default="all", help="Filter by status")
+def hypothesis_list(status: str):
+    """List all hypotheses with their current status and confidence."""
+    from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+    init_backtest_db()
+    with get_backtest_db() as conn:
+        if status == "all":
+            rows = conn.execute(
+                "SELECT * FROM bt_hypotheses ORDER BY id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM bt_hypotheses WHERE status = ? ORDER BY id",
+                (status,),
+            ).fetchall()
+
+        # Get evidence counts
+        evidence_counts = {}
+        for row in rows:
+            cnt = conn.execute(
+                "SELECT COUNT(*) as c FROM bt_hypothesis_evidence WHERE hypothesis_id = ?",
+                (row["id"],),
+            ).fetchone()
+            evidence_counts[row["id"]] = cnt["c"]
+
+    if not rows:
+        console.print("[dim]No hypotheses found.[/]")
+        return
+
+    table = Table(title=f"Hypotheses ({len(rows)})")
+    table.add_column("ID", justify="right")
+    table.add_column("Name")
+    table.add_column("Status")
+    table.add_column("Confidence", justify="right")
+    table.add_column("Evidence", justify="right")
+    table.add_column("Category")
+    table.add_column("Volume Range")
+
+    status_colors = {
+        "proposed": "dim",
+        "testing": "yellow",
+        "confirmed": "green",
+        "rejected": "red",
+        "invalidated": "dim strikethrough",
+    }
+
+    for row in rows:
+        s = row["status"]
+        color = status_colors.get(s, "")
+        vol_range = ""
+        if row["volume_min"] or row["volume_max"]:
+            vmin = f"${row['volume_min']:,.0f}" if row["volume_min"] else "-"
+            vmax = f"${row['volume_max']:,.0f}" if row["volume_max"] else "-"
+            vol_range = f"{vmin} - {vmax}"
+
+        table.add_row(
+            str(row["id"]),
+            row["name"],
+            f"[{color}]{s}[/{color}]",
+            f"{row['confidence_score']:.2f}" if row["confidence_score"] else "0.00",
+            str(evidence_counts.get(row["id"], 0)),
+            row["category_filter"] or "(null)",
+            vol_range,
+        )
+    console.print(table)
+
+
+@hypothesis.command("propose")
+@click.option("--name", "-n", required=True, help="Short unique name")
+@click.option("--description", "-d", required=True, help="Testable description")
+@click.option("--category", "-c", default=None, help="Category filter (use 'null' for prediction markets)")
+@click.option("--volume-min", type=float, default=None, help="Minimum volume")
+@click.option("--volume-max", type=float, default=None, help="Maximum volume")
+@click.option("--half-life", type=int, default=90, help="Confidence decay half-life in days")
+def hypothesis_propose(name, description, category, volume_min, volume_max, half_life):
+    """Propose a new hypothesis about agent performance."""
+    from polymarket_agent.backtest.hypothesis import propose
+
+    cat = None if (category and category.lower() == "null") else category
+    hyp_id = propose(
+        name=name,
+        description=description,
+        category_filter=cat,
+        volume_min=volume_min,
+        volume_max=volume_max,
+        decay_half_life_days=half_life,
+    )
+    console.print(f"\n[green]Hypothesis #{hyp_id} proposed: {name}[/]")
+    console.print(f"  {description}")
+    console.print(f"\n[dim]Next: polymarket backtest hypothesis test {hyp_id}[/]")
+
+
+@hypothesis.command("test")
+@click.argument("hypothesis_id", type=int)
+@click.option("--count", "-n", type=int, default=50, help="Markets to simulate")
+@click.option("--dry-run", is_flag=True, help="Preview market selection only")
+def hypothesis_test(hypothesis_id: int, count: int, dry_run: bool):
+    """Run targeted simulation to test a hypothesis."""
+    from polymarket_agent.backtest.hypothesis import test as hyp_test
+
+    console.print(f"\nTesting hypothesis #{hypothesis_id} with {count} markets...")
+
+    if dry_run:
+        console.print("[yellow]Dry run not yet supported for hypothesis test[/]")
+        return
+
+    result = hyp_test(hypothesis_id, count=count)
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/]")
+        return
+
+    console.print(f"\n[green]Simulation complete (Run #{result['run_id']})[/]")
+    console.print(f"  Trials: {result['valid_trials']}/{result['market_count']}")
+    if result.get("agent_brier") is not None:
+        console.print(f"  Agent Brier: {result['agent_brier']:.4f}")
+    console.print(f"  Cost: ${result['total_cost']:.4f}")
+    console.print(f"\n[dim]Next: polymarket backtest hypothesis evaluate {hypothesis_id}[/]")
+
+
+@hypothesis.command("evaluate")
+@click.argument("hypothesis_id", type=int)
+def hypothesis_evaluate(hypothesis_id: int):
+    """Evaluate evidence and update hypothesis status."""
+    from polymarket_agent.backtest.hypothesis import evaluate
+
+    result = evaluate(hypothesis_id)
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/]")
+        return
+
+    prev = result.get("previous_status", "?")
+    curr = result["status"]
+    transition = f"{prev} → {curr}" if prev != curr else curr
+
+    color = {"confirmed": "green", "rejected": "red", "invalidated": "red"}.get(curr, "yellow")
+    console.print(f"\n[bold]Hypothesis #{hypothesis_id} Evaluation[/]")
+    console.print(f"  Status: [{color}]{transition}[/{color}]")
+    console.print(f"  Confidence: {result['confidence_score']:.2f}")
+    console.print(f"  Evidence records: {result['evidence_count']}")
+    console.print(f"  Weighted Brier diff: {result['weighted_brier_diff']:+.4f}")
+    console.print(f"  Effective trials: {result['effective_trials']}")
+    console.print(f"  Recommendation: {result['recommendation']}")
+
+
+@hypothesis.command("retest")
+@click.argument("hypothesis_id", type=int)
+@click.option("--count", "-n", type=int, default=50, help="Markets to simulate")
+def hypothesis_retest(hypothesis_id: int, count: int):
+    """Run fresh simulation and re-evaluate with recency weighting."""
+    from polymarket_agent.backtest.hypothesis import retest
+
+    console.print(f"\nRe-testing hypothesis #{hypothesis_id}...")
+    result = retest(hypothesis_id, count=count)
+
+    test_result = result.get("test", {})
+    eval_result = result.get("evaluation", {})
+
+    if "error" in test_result:
+        console.print(f"[red]{test_result['error']}[/]")
+        return
+
+    console.print(f"\n[green]Re-test complete[/]")
+    console.print(f"  Run: #{test_result.get('run_id')}")
+    console.print(f"  Status: {eval_result.get('status')}")
+    console.print(f"  Confidence: {eval_result.get('confidence_score', 0):.2f}")
+    console.print(f"  Recommendation: {eval_result.get('recommendation')}")
+
+
+@hypothesis.command("actions")
+def hypothesis_actions():
+    """Display all active hypothesis-driven actions."""
+    from polymarket_agent.backtest.hypothesis import load_active_hypothesis_actions
+
+    actions = load_active_hypothesis_actions()
+    if not actions:
+        console.print("[dim]No active hypothesis actions.[/]")
+        return
+
+    table = Table(title=f"Active Hypothesis Actions ({len(actions)})")
+    table.add_column("Hypothesis")
+    table.add_column("Type")
+    table.add_column("Config")
+    table.add_column("Base Str", justify="right")
+    table.add_column("Eff Str", justify="right")
+
+    for a in actions:
+        cfg_str = str(a["config"])[:40]
+        table.add_row(
+            a["hypothesis_name"],
+            a["action_type"],
+            cfg_str,
+            f"{a['base_strength']:.2f}",
+            f"{a['effective_strength']:.2f}",
+        )
+    console.print(table)
+
+
+@hypothesis.command("decay-check")
+def hypothesis_decay_check():
+    """Check confirmed hypotheses for confidence decay."""
+    from polymarket_agent.backtest.hypothesis import decay_check
+
+    results = decay_check()
+    if not results:
+        console.print("[dim]No confirmed hypotheses to check.[/]")
+        return
+
+    table = Table(title="Hypothesis Decay Check")
+    table.add_column("Name")
+    table.add_column("Original", justify="right")
+    table.add_column("Decayed", justify="right")
+    table.add_column("Days Since", justify="right")
+    table.add_column("Threshold", justify="right")
+    table.add_column("Action")
+
+    for r in results:
+        color = {"ok": "green", "retest": "yellow", "invalidate": "red"}.get(
+            r["recommendation"], ""
+        )
+        table.add_row(
+            r["name"],
+            f"{r['original_confidence']:.2f}",
+            f"{r['decayed_confidence']:.2f}",
+            str(r["days_since_evidence"]),
+            f"{r['retest_threshold']:.2f}",
+            f"[{color}]{r['recommendation'].upper()}[/{color}]",
+        )
+    console.print(table)
+
+
 if __name__ == "__main__":
     cli()

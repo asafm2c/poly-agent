@@ -86,7 +86,7 @@ class ProbabilityEstimator:
 
     def estimate(
         self, market: Market, calibration_text: str | None = None,
-        token_id: str | None = None,
+        token_id: str | None = None, model: str | None = None,
     ) -> ProbabilityEstimate:
         """Run full four-pass estimation on a market (including adversarial)."""
         # Gather research
@@ -95,12 +95,12 @@ class ProbabilityEstimator:
         dossier_text = self.research.format_dossier_for_llm(dossier)
 
         # Pass 1: Base rate
-        base_rate_result = self._pass1_base_rate(market)
+        base_rate_result = self._pass1_base_rate(market, model=model)
         base_rate = base_rate_result.get("base_rate", 0.5)
         base_reasoning = base_rate_result.get("reasoning", "No reasoning provided")
 
         # Pass 2: Bayesian update
-        update_result = self._pass2_update(market, base_rate, base_reasoning, dossier_text)
+        update_result = self._pass2_update(market, base_rate, base_reasoning, dossier_text, model=model)
         updated_estimate = update_result.get("updated_estimate", base_rate)
         key_evidence = update_result.get("key_evidence", [])
         thesis = update_result.get("thesis", "")
@@ -111,6 +111,7 @@ class ProbabilityEstimator:
         adv_result = self._pass25_adversarial(
             market, updated_estimate, conf_low, conf_high,
             dossier.order_book_signals, dossier.related_markets,
+            model=model,
         )
         adversarial_estimate = adv_result.get("revised_estimate", updated_estimate)
         adv_conf_low = adv_result.get("confidence_low", conf_low)
@@ -120,7 +121,8 @@ class ProbabilityEstimator:
         # Pass 3: Calibration adjustment
         cal_text = calibration_text or NO_CALIBRATION_TEXT
         cal_result = self._pass3_calibration(
-            market, adversarial_estimate, adv_conf_low, adv_conf_high, cal_text
+            market, adversarial_estimate, adv_conf_low, adv_conf_high, cal_text,
+            model=model,
         )
         final_estimate = cal_result.get("final_estimate", adversarial_estimate)
         final_conf_low = cal_result.get("confidence_low", adv_conf_low)
@@ -146,7 +148,7 @@ class ProbabilityEstimator:
             timestamp=datetime.utcnow(),
         )
 
-    def _pass1_base_rate(self, market: Market) -> dict:
+    def _pass1_base_rate(self, market: Market, model: str | None = None) -> dict:
         prompt = BASE_RATE_PROMPT.format(
             question=market.question,
             category=market.category or "Unknown",
@@ -154,14 +156,15 @@ class ProbabilityEstimator:
         )
         try:
             return self.llm.complete_json(
-                prompt=prompt, system=BASE_RATE_SYSTEM, max_tokens=512
+                prompt=prompt, system=BASE_RATE_SYSTEM, max_tokens=512, model=model
             )
         except Exception as e:
             logger.error("Pass 1 failed for %s: %s", market.id, e)
             return {"base_rate": 0.5, "reasoning": f"Base rate estimation failed: {e}"}
 
     def _pass2_update(
-        self, market: Market, base_rate: float, base_reasoning: str, dossier_text: str
+        self, market: Market, base_rate: float, base_reasoning: str, dossier_text: str,
+        model: str | None = None,
     ) -> dict:
         prompt = UPDATE_PROMPT.format(
             question=market.question,
@@ -173,7 +176,7 @@ class ProbabilityEstimator:
         )
         try:
             return self.llm.complete_json(
-                prompt=prompt, system=UPDATE_SYSTEM, max_tokens=1024
+                prompt=prompt, system=UPDATE_SYSTEM, max_tokens=1024, model=model
             )
         except Exception as e:
             logger.error("Pass 2 failed for %s: %s", market.id, e)
@@ -191,6 +194,7 @@ class ProbabilityEstimator:
         conf_high: float,
         order_book_signals: OrderBookSignals | None = None,
         related_markets: list[dict] | None = None,
+        model: str | None = None,
     ) -> dict:
         """Adversarial pass: challenge the estimate by considering why the market might be right."""
         market_price = market.last_price_yes or 0.5
@@ -240,7 +244,7 @@ class ProbabilityEstimator:
         try:
             return self.llm.complete_json(
                 prompt=prompt, system=ADVERSARIAL_SYSTEM,
-                max_tokens=768, temperature=0.3,
+                max_tokens=768, temperature=0.3, model=model,
             )
         except Exception as e:
             logger.error("Pass 2.5 (adversarial) failed for %s: %s", market.id, e)
@@ -259,6 +263,7 @@ class ProbabilityEstimator:
         conf_low: float,
         conf_high: float,
         calibration_text: str,
+        model: str | None = None,
     ) -> dict:
         prompt = CALIBRATION_PROMPT.format(
             question=market.question,
@@ -270,7 +275,7 @@ class ProbabilityEstimator:
         )
         try:
             return self.llm.complete_json(
-                prompt=prompt, system=CALIBRATION_SYSTEM, max_tokens=512
+                prompt=prompt, system=CALIBRATION_SYSTEM, max_tokens=512, model=model
             )
         except Exception as e:
             logger.error("Pass 3 failed for %s: %s", market.id, e)

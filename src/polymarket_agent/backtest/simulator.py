@@ -22,6 +22,26 @@ DEFAULT_BANKROLL = 1000.0
 DEFAULT_FEE_RATE = 0.02  # 2% round-trip
 DEFAULT_EDGE_THRESHOLD = 0.10
 
+# Multi-model evaluation constants
+VOLUME_TIERS = {
+    ">10M": (10_000_000, None),
+    "1M-10M": (1_000_000, 10_000_000),
+    "100K-1M": (100_000, 1_000_000),
+    "10K-100K": (10_000, 100_000),
+}
+
+EVALUATION_MODELS = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+]
+
+MODEL_COST_PER_TRIAL = {
+    "claude-haiku-4-5-20251001": 0.005,
+    "claude-sonnet-4-6": 0.023,
+    "claude-opus-4-6": 0.12,
+}
+
 
 # ---------------------------------------------------------------------------
 # Historical Research Gatherer (replaces live ResearchGatherer)
@@ -389,6 +409,8 @@ def run_simulation(
     fee_rate: float = DEFAULT_FEE_RATE,
     dry_run: bool = False,
     db_path: Path | None = None,
+    model: str | None = None,
+    hypothesis_id: int | None = None,
 ) -> dict:
     """Run a simulation across selected markets.
 
@@ -407,6 +429,10 @@ def run_simulation(
         "fee_rate": fee_rate,
         "market_count": len(markets),
     }
+    if model:
+        config["model"] = model
+    if hypothesis_id is not None:
+        config["hypothesis_id"] = hypothesis_id
 
     if dry_run:
         return _dry_run(markets, horizon, config)
@@ -460,7 +486,7 @@ def run_simulation(
         confidence_high = None
         reasoning = None
         try:
-            estimate = estimator.estimate(market_obj)
+            estimate = estimator.estimate(market_obj, model=model)
             agent_estimate = estimate.final_estimate
             confidence_low = estimate.confidence_low
             confidence_high = estimate.confidence_high
@@ -489,6 +515,15 @@ def run_simulation(
 
         trial_duration = int((time.time() - trial_start) * 1000)
 
+        # Compute training recency score
+        recency_score = None
+        if model and market_dict.get("end_date"):
+            from polymarket_agent.backtest.analysis import training_recency_score
+            try:
+                recency_score = training_recency_score(market_dict["end_date"], model)
+            except Exception:
+                pass
+
         # Persist trial
         with get_backtest_db(path) as conn:
             conn.execute(
@@ -496,14 +531,15 @@ def run_simulation(
                 (run_id, market_id, horizon_days, market_price_at_horizon,
                  agent_estimate, confidence_low, confidence_high, outcome,
                  agent_brier, market_brier, edge, simulated_trade,
-                 reasoning, llm_cost, duration_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 reasoning, llm_cost, duration_ms, model, training_recency_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, market_dict["id"], horizon, market_price,
                     agent_estimate, confidence_low, confidence_high, outcome,
                     agent_brier, market_brier, edge,
                     json.dumps(trade) if trade else None,
                     reasoning, trial_cost, trial_duration,
+                    model, recency_score,
                 ),
             )
 
@@ -544,6 +580,30 @@ def run_simulation(
             WHERE id = ?""",
             (completed_at, avg_agent_brier, avg_market_brier, total_pnl, total_cost, run_id),
         )
+
+    # Auto-record hypothesis evidence if linked
+    if hypothesis_id is not None and valid_trials > 0:
+        try:
+            from polymarket_agent.backtest.hypothesis import record_evidence
+            brier_diff = None
+            if avg_agent_brier is not None and avg_market_brier is not None:
+                brier_diff = avg_agent_brier - avg_market_brier
+            supports = None
+            if brier_diff is not None and valid_trials >= 5:
+                supports = 1 if brier_diff < 0 else 0
+            record_evidence(
+                hypothesis_id=hypothesis_id,
+                run_id=run_id,
+                trial_count=valid_trials,
+                agent_brier=avg_agent_brier,
+                market_brier=avg_market_brier,
+                brier_diff=brier_diff,
+                simulated_pnl=total_pnl,
+                supports_hypothesis=supports,
+                db_path=path,
+            )
+        except Exception as e:
+            logger.warning("Failed to record hypothesis evidence: %s", e)
 
     return {
         "run_id": run_id,
@@ -586,4 +646,204 @@ def _dry_run(markets: list[dict], horizon: int, config: dict) -> dict:
         "markets": results,
         "skipped": skipped,
         "total": len(results),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stratified Market Selection
+# ---------------------------------------------------------------------------
+
+
+def select_markets_stratified(
+    n_per_cell: int = 20,
+    categories: list[str | None] | None = None,
+    volume_tiers: dict[str, tuple[float, float | None]] | None = None,
+    horizon: int = DEFAULT_HORIZON,
+    db_path: Path | None = None,
+) -> tuple[list[dict], dict]:
+    """Select markets with stratified sampling across category x volume tier.
+
+    Returns:
+        (markets, cell_counts) where cell_counts is
+        {(category, tier): {"requested": n, "available": m, "selected": k}}
+    """
+    tiers = volume_tiers or VOLUME_TIERS
+    path = db_path or settings.backtest_db_path
+
+    with get_backtest_db(path) as conn:
+        # Auto-discover categories if not specified
+        if categories is None:
+            cat_rows = conn.execute(
+                """SELECT DISTINCT m.category
+                FROM bt_markets m
+                WHERE m.has_history = 1
+                  AND m.resolution_outcome IN ('YES', 'NO')
+                  AND EXISTS (
+                      SELECT 1 FROM bt_price_history p
+                      WHERE p.market_id = m.id
+                      AND p.timestamp <= CAST(strftime('%%s', m.end_date, '-%d days') AS INTEGER)
+                  )
+                ORDER BY m.category NULLS FIRST""" % horizon
+            ).fetchall()
+            categories = [row["category"] for row in cat_rows]
+
+        markets = []
+        cell_counts = {}
+
+        for cat in categories:
+            for tier_name, (vol_min, vol_max) in tiers.items():
+                # Build query for this cell
+                conditions = [
+                    "m.has_history = 1",
+                    "m.resolution_outcome IN ('YES', 'NO')",
+                    """EXISTS (
+                        SELECT 1 FROM bt_price_history p
+                        WHERE p.market_id = m.id
+                        AND p.timestamp <= CAST(strftime('%%s', m.end_date, '-%d days') AS INTEGER)
+                    )""" % horizon,
+                    "m.volume >= ?",
+                ]
+                params: list = [vol_min]
+
+                if vol_max is not None:
+                    conditions.append("m.volume < ?")
+                    params.append(vol_max)
+
+                if cat is None:
+                    conditions.append("m.category IS NULL")
+                else:
+                    conditions.append("m.category = ?")
+                    params.append(cat)
+
+                where = " AND ".join(conditions)
+
+                # Count available
+                count_row = conn.execute(
+                    f"SELECT COUNT(*) as c FROM bt_markets m WHERE {where}", params
+                ).fetchone()
+                available = count_row["c"]
+
+                # Sample
+                rows = conn.execute(
+                    f"""SELECT m.id, m.question, m.description, m.category, m.end_date,
+                            m.volume, m.liquidity, m.resolution_outcome, m.yes_token,
+                            m.no_token, m.event_id
+                    FROM bt_markets m
+                    WHERE {where}
+                    ORDER BY RANDOM()
+                    LIMIT ?""",
+                    params + [n_per_cell],
+                ).fetchall()
+
+                selected = len(rows)
+                cell_key = (cat, tier_name)
+                cell_counts[cell_key] = {
+                    "requested": n_per_cell,
+                    "available": available,
+                    "selected": selected,
+                }
+
+                if selected < n_per_cell:
+                    logger.warning(
+                        "Cell (%s, %s): only %d/%d markets available",
+                        cat or "(null)", tier_name, available, n_per_cell,
+                    )
+
+                # Load price history for selected markets
+                for row in rows:
+                    market = dict(row)
+                    history = conn.execute(
+                        """SELECT timestamp as t, price as p
+                        FROM bt_price_history
+                        WHERE market_id = ?
+                        ORDER BY timestamp""",
+                        (row["id"],),
+                    ).fetchall()
+                    market["price_history"] = [{"t": h["t"], "p": h["p"]} for h in history]
+                    markets.append(market)
+
+    logger.info(
+        "Stratified selection: %d markets across %d cells (%d categories x %d tiers)",
+        len(markets), len(cell_counts), len(categories), len(tiers),
+    )
+    return markets, cell_counts
+
+
+# ---------------------------------------------------------------------------
+# Multi-Model Evaluation
+# ---------------------------------------------------------------------------
+
+
+def run_multi_model_evaluation(
+    markets: list[dict],
+    models: list[str] | None = None,
+    horizon: int = DEFAULT_HORIZON,
+    edge_threshold: float = DEFAULT_EDGE_THRESHOLD,
+    bankroll: float = DEFAULT_BANKROLL,
+    fee_rate: float = DEFAULT_FEE_RATE,
+    budget: float | None = None,
+    progressive: bool = True,
+    progress_callback=None,
+    db_path: Path | None = None,
+) -> dict:
+    """Run evaluation across multiple models on the same market set.
+
+    Args:
+        models: Model IDs in execution order. Default: Haiku, Sonnet, Opus.
+        budget: Maximum total LLM cost in USD. None = no limit.
+        progressive: If True, call progress_callback after each model.
+            Callback signature: (model, run_result, comparison_so_far) -> bool.
+            Return False to stop.
+        progress_callback: Callable for progressive mode.
+
+    Returns:
+        {"runs": {model: run_result}, "comparison": cross_model_comparison_dict}
+    """
+    from polymarket_agent.backtest.analysis import cross_model_comparison
+
+    model_list = models or EVALUATION_MODELS
+    runs = {}
+    run_ids = []
+    spent = 0.0
+
+    for model_id in model_list:
+        # Budget check
+        estimated_cost = len(markets) * MODEL_COST_PER_TRIAL.get(model_id, 0.05)
+        if budget is not None and spent + estimated_cost > budget:
+            logger.warning(
+                "Skipping %s: estimated $%.2f would exceed budget ($%.2f spent of $%.2f)",
+                model_id, estimated_cost, spent, budget,
+            )
+            continue
+
+        # Run simulation for this model
+        result = run_simulation(
+            markets=markets,
+            horizon=horizon,
+            edge_threshold=edge_threshold,
+            bankroll=bankroll,
+            fee_rate=fee_rate,
+            db_path=db_path,
+            model=model_id,
+        )
+        runs[model_id] = result
+        run_ids.append(result["run_id"])
+        spent += result.get("total_cost", 0.0)
+
+        # Progressive callback
+        if progressive and progress_callback:
+            comparison_so_far = cross_model_comparison(run_ids, db_path=db_path) if len(run_ids) > 1 else None
+            should_continue = progress_callback(model_id, result, comparison_so_far)
+            if not should_continue:
+                logger.info("Progressive mode: stopped after %s", model_id)
+                break
+
+    # Final comparison
+    comparison = cross_model_comparison(run_ids, db_path=db_path) if len(run_ids) > 1 else {}
+
+    return {
+        "runs": runs,
+        "run_ids": run_ids,
+        "comparison": comparison,
+        "total_spent": spent,
     }
