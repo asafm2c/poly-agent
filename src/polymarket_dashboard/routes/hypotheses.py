@@ -15,11 +15,11 @@ def _get_bt_db(request: Request):
 async def hypotheses_list(request: Request, status: str | None = None):
     bt_db = _get_bt_db(request)
     if bt_db is None:
-        return {"available": False, "hypotheses": []}
+        return {"available": False, "tables_exist": False, "hypotheses": []}
 
     async with bt_db.connection() as conn:
         if not await conn.table_exists("bt_hypotheses"):
-            return {"available": False, "hypotheses": []}
+            return {"available": True, "tables_exist": False, "hypotheses": []}
 
         if status:
             rows = await conn.execute_fetchall(

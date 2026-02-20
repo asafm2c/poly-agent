@@ -202,7 +202,9 @@ def select_markets(
     ]
     params: list = []
 
-    if category is not None:
+    if category == "*":
+        pass  # No category filter — include all categories
+    elif category is not None:
         conditions.append("m.category = ?")
         params.append(category)
     else:

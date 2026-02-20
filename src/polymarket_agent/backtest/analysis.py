@@ -813,10 +813,13 @@ def cross_model_comparison(
 
         models_summary[model] = {
             "run_id": data["run_id"],
+            "model": model,
             "agent_brier": avg_ab,
             "market_brier": avg_mb,
             "brier_diff": (avg_ab - avg_mb) if avg_ab is not None and avg_mb is not None else None,
-            "weighted": wb,
+            "agent_brier_weighted": wb.get("agent_brier_weighted"),
+            "market_brier_weighted": wb.get("market_brier_weighted"),
+            "brier_diff_weighted": wb.get("brier_diff_weighted"),
             "trial_count": len(valid),
         }
 

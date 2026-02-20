@@ -32,7 +32,9 @@ async def evaluation_runs(request: Request):
             """SELECT r.id, r.started_at, r.completed_at, r.config,
                       r.market_count, r.agent_brier, r.market_brier,
                       r.simulated_pnl, r.total_cost,
-                      COUNT(t.id) as trial_count
+                      COUNT(t.id) as trial_count,
+                      SUM(CASE WHEN t.agent_brier IS NOT NULL THEN 1 ELSE 0 END) as valid_trials,
+                      SUM(CASE WHEN t.simulated_trade IS NOT NULL THEN 1 ELSE 0 END) as trade_count
             FROM bt_simulation_runs r
             LEFT JOIN bt_simulation_trials t ON t.run_id = r.id
             GROUP BY r.id
@@ -65,6 +67,8 @@ async def evaluation_runs(request: Request):
             "brier_diff": brier_diff,
             "simulated_pnl": round(r["simulated_pnl"], 2) if r["simulated_pnl"] is not None else None,
             "total_cost": round(r["total_cost"], 4) if r["total_cost"] is not None else None,
+            "valid_trials": r["valid_trials"] or 0,
+            "trade_count": r["trade_count"] or 0,
         })
 
     return {"available": True, "runs": runs}
@@ -75,6 +79,7 @@ async def evaluation_trials(
     request: Request,
     run_id: int,
     sort_by: str = "market_id",
+    sort_dir: str = "desc",
     category: str | None = None,
     volume_tier: str | None = None,
 ):
@@ -82,9 +87,11 @@ async def evaluation_trials(
     if bt_db is None:
         return {"available": False, "trials": []}
 
-    allowed_sorts = {"market_id", "agent_brier", "market_brier", "edge", "volume"}
-    if sort_by not in allowed_sorts:
-        sort_by = "market_id"
+    allowed_sorts = {"market_id", "agent_brier", "market_brier", "edge", "volume", "brier_diff": "agent_brier"}
+    sort_col = sort_by if sort_by in ("market_id", "agent_brier", "market_brier", "edge") else "t.market_id"
+    if sort_by == "volume":
+        sort_col = "m.volume"
+    direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
 
     async with bt_db.connection() as conn:
         rows = await conn.execute_fetchall(
@@ -92,7 +99,7 @@ async def evaluation_trials(
             FROM bt_simulation_trials t
             JOIN bt_markets m ON t.market_id = m.id
             WHERE t.run_id = ?
-            ORDER BY {sort_by} DESC""",
+            ORDER BY {sort_col} {direction}""",
             (run_id,),
         )
 
@@ -273,21 +280,48 @@ async def evaluation_compare(
     if bt_db is None:
         return {"available": False, "runs": []}
 
+    # Build filter conditions for per-trial aggregation
+    trial_conditions = ["t.agent_brier IS NOT NULL"]
+    trial_params: list = []
+    if category:
+        if category == "(null)":
+            trial_conditions.append("m.category IS NULL")
+        else:
+            trial_conditions.append("m.category = ?")
+            trial_params.append(category)
+    if volume_tier:
+        tier_ranges = {">10M": (10000000, None), "1M-10M": (1000000, 10000000),
+                       "100K-1M": (100000, 1000000), "10K-100K": (10000, 100000)}
+        if volume_tier in tier_ranges:
+            vmin, vmax = tier_ranges[volume_tier]
+            trial_conditions.append("m.volume >= ?")
+            trial_params.append(vmin)
+            if vmax is not None:
+                trial_conditions.append("m.volume < ?")
+                trial_params.append(vmax)
+
+    trial_where = " AND ".join(trial_conditions)
+
     async with bt_db.connection() as conn:
         runs = await conn.execute_fetchall(
-            """SELECT r.id, r.config, r.agent_brier, r.market_brier,
-                      r.total_cost, r.started_at,
-                      COUNT(t.id) as trial_count
+            f"""SELECT r.id, r.config, r.total_cost, r.started_at,
+                      COUNT(t.id) as trial_count,
+                      AVG(t.agent_brier) as agent_brier,
+                      AVG(t.market_brier) as market_brier
             FROM bt_simulation_runs r
             LEFT JOIN bt_simulation_trials t ON t.run_id = r.id
-            WHERE r.completed_at IS NOT NULL
+            LEFT JOIN bt_markets m ON t.market_id = m.id
+            WHERE r.completed_at IS NOT NULL AND {trial_where}
             GROUP BY r.id
             ORDER BY r.id DESC
-            LIMIT 20"""
+            LIMIT 20""",
+            trial_params,
         )
 
     result = []
     for r in runs:
+        if r["trial_count"] == 0:
+            continue
         model = None
         if r["config"]:
             try:
@@ -296,15 +330,15 @@ async def evaluation_compare(
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        brier_diff = None
-        if r["agent_brier"] is not None and r["market_brier"] is not None:
-            brier_diff = round(r["agent_brier"] - r["market_brier"], 4)
+        ab = r["agent_brier"]
+        mb = r["market_brier"]
+        brier_diff = round(ab - mb, 4) if ab is not None and mb is not None else None
 
         result.append({
             "id": r["id"],
             "model": model,
-            "agent_brier": round(r["agent_brier"], 4) if r["agent_brier"] is not None else None,
-            "market_brier": round(r["market_brier"], 4) if r["market_brier"] is not None else None,
+            "agent_brier": round(ab, 4) if ab is not None else None,
+            "market_brier": round(mb, 4) if mb is not None else None,
             "brier_diff": brier_diff,
             "trial_count": r["trial_count"],
             "total_cost": round(r["total_cost"], 4) if r["total_cost"] else None,

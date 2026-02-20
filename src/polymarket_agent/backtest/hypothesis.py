@@ -336,7 +336,8 @@ def test(
 
     # Extract filters
     cat_filter = hyp["category_filter"]
-    category = None if cat_filter is None else (None if cat_filter == "*" else cat_filter)
+    # None = null-category markets, "*" = all categories (passed through to select_markets)
+    category = cat_filter
     vol_min = hyp["volume_min"]
     vol_max = hyp["volume_max"]
 
@@ -406,9 +407,16 @@ def decay_check(db_path: Path | None = None) -> list[dict]:
 
             days_elapsed = (now - last_evidence).total_seconds() / 86400.0
             half_life = hyp["decay_half_life_days"] or 90
-            base_confidence = hyp["confidence_score"] or 0.0
 
-            # Exponential decay
+            # Recompute base confidence from evidence (not the stored value,
+            # which may already be decayed from a prior call)
+            evidence = conn.execute(
+                "SELECT * FROM bt_hypothesis_evidence WHERE hypothesis_id = ? ORDER BY recorded_at",
+                (hyp["id"],),
+            ).fetchall()
+            base_confidence = _compute_weighted_confidence([dict(e) for e in evidence])
+
+            # Apply time-based decay from last evidence
             decayed = base_confidence * (0.5 ** (days_elapsed / half_life))
 
             # Update confidence
