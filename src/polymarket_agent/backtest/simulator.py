@@ -173,6 +173,12 @@ def select_markets(
     conditions = [
         "m.has_history = 1",
         "m.resolution_outcome IN ('YES', 'NO')",
+        # Ensure price history spans at least `horizon` days before resolution
+        """EXISTS (
+            SELECT 1 FROM bt_price_history p
+            WHERE p.market_id = m.id
+            AND p.timestamp <= CAST(strftime('%%s', m.end_date, '-%d days') AS INTEGER)
+        )""" % horizon,
     ]
     params: list = []
 
