@@ -115,11 +115,38 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        # Extract JSON from response (handle markdown code blocks)
+
+        result = self._extract_json(text)
+        if result is not None:
+            return result
+
+        # Retry once with explicit JSON instruction
+        logger.warning("JSON parse failed, retrying with explicit instruction")
+        retry_text = self.complete(
+            prompt=prompt + "\n\nIMPORTANT: Respond with ONLY a valid JSON object. No other text.",
+            model=model,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+
+        result = self._extract_json(retry_text)
+        if result is not None:
+            return result
+
+        raise json.JSONDecodeError(
+            "Failed to extract JSON after retry",
+            retry_text[:200], 0,
+        )
+
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """Extract a JSON object from text, handling code fences and surrounding prose."""
         text = text.strip()
-        if text.startswith("```"):
+
+        # Strip markdown code fences
+        if "```" in text:
             lines = text.split("\n")
-            # Remove first and last lines (```json and ```)
             json_lines = []
             in_block = False
             for line in lines:
@@ -127,12 +154,29 @@ class LLMClient:
                     in_block = True
                     continue
                 elif line.strip() == "```" and in_block:
-                    break
+                    in_block = False
+                    continue
                 elif in_block:
                     json_lines.append(line)
-            text = "\n".join(json_lines)
+            if json_lines:
+                text = "\n".join(json_lines)
 
-        return json.loads(text)
+        # Try direct parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Find first { and last } to extract embedded JSON object
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         costs = MODEL_COSTS.get(model, {"input": 3.0, "output": 15.0})
