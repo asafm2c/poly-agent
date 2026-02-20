@@ -35,6 +35,33 @@ class _Connection:
         return row is not None
 
 
+class BacktestDB:
+    """Read-only async access to backtest.db. Returns None from create() if file missing."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+
+    @classmethod
+    def create(cls, db_path: Path) -> "BacktestDB | None":
+        if not db_path.exists():
+            return None
+        return cls(db_path)
+
+    @asynccontextmanager
+    async def connection(self):
+        db = await aiosqlite.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+        )
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA query_only=ON")
+        await db.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield _Connection(db)
+        finally:
+            await db.close()
+
+
 class DashboardDB:
     def __init__(self, db_path: Path):
         self.db_path = db_path
