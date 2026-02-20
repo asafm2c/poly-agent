@@ -98,16 +98,16 @@
 - [ ] 7.1 Unit test `select_markets_stratified()`
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.2 Unit test `training_recency_score()`
+- [x] 7.2 Unit test `training_recency_score()` — TestTrainingRecencyScore (5 tests)
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.3 Unit test `brier_confidence_interval()`
+- [x] 7.3 Unit test `brier_confidence_interval()` — TestBrierConfidenceInterval (5 tests)
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.4 Unit test `weighted_brier()`
+- [x] 7.4 Unit test `weighted_brier()` — TestWeightedBrier (3 tests)
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.5 Unit test `cross_model_comparison()`
+- [x] 7.5 Unit test `cross_model_comparison()` — TestCrossModelComparison (5 tests)
   - Files: `tests/test_backtest.py`
 
 - [ ] 7.6 Integration test `run_multi_model_evaluation()` with mocked LLM

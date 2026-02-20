@@ -48,6 +48,13 @@ def propose(
     tf_json = json.dumps(temporal_filter) if temporal_filter else None
 
     with get_backtest_db(path) as conn:
+        # Validate unique name
+        existing = conn.execute(
+            "SELECT 1 FROM bt_hypotheses WHERE name = ?", (name,)
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Hypothesis with name '{name}' already exists")
+
         cursor = conn.execute(
             """INSERT INTO bt_hypotheses
             (name, description, status, confidence_score, category_filter,
@@ -226,7 +233,7 @@ def evaluate(hypothesis_id: int, db_path: Path | None = None) -> dict:
             if len(recent) >= REJECT_CONSECUTIVE_CONTRARY:
                 if all(e.get("supports_hypothesis") == 0 for e in recent):
                     new_status = "invalidated"
-                    recommendation = "demoted"
+                    recommendation = "invalidated"
                     conn.execute(
                         """UPDATE bt_hypotheses
                         SET status = 'invalidated', invalidated_at = ?,

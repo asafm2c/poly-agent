@@ -87,7 +87,7 @@ async def evaluation_trials(
     if bt_db is None:
         return {"available": False, "trials": []}
 
-    allowed_sorts = {"market_id", "agent_brier", "market_brier", "edge", "volume", "brier_diff": "agent_brier"}
+    allowed_sorts = {"market_id", "agent_brier", "market_brier", "edge", "volume"}
     sort_col = sort_by if sort_by in ("market_id", "agent_brier", "market_brier", "edge") else "t.market_id"
     if sort_by == "volume":
         sort_col = "m.volume"

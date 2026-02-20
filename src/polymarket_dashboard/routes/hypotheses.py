@@ -60,7 +60,7 @@ async def hypotheses_list(request: Request, status: str | None = None):
             "retest_threshold": r["retest_threshold"],
         })
 
-    return {"available": True, "hypotheses": hypotheses}
+    return {"available": True, "tables_exist": True, "hypotheses": hypotheses}
 
 
 @router.get("/{hypothesis_id}/evidence")
