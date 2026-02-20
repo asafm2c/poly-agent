@@ -563,5 +563,212 @@ def show_strategy():
             )
 
 
+@backtest.command("simulate")
+@click.option("--horizon", type=int, default=7, help="Days before resolution (default: 7)")
+@click.option("--count", "-n", type=int, default=50, help="Number of markets to simulate (default: 50)")
+@click.option("--category", "-c", help="Filter by category (default: null/prediction markets)")
+@click.option("--min-volume", type=float, default=100000, help="Minimum volume (default: 100000)")
+@click.option("--max-volume", type=float, default=None, help="Maximum volume")
+@click.option("--regime", "-r", help="Filter by regime (e.g. o1-era)")
+@click.option("--dry-run", is_flag=True, help="Preview market selection without running LLM")
+def simulate_backtest(
+    horizon: int,
+    count: int,
+    category: str | None,
+    min_volume: float,
+    max_volume: float | None,
+    regime: str | None,
+    dry_run: bool,
+):
+    """Run LLM estimation against historical markets to measure accuracy."""
+    from polymarket_agent.backtest.simulator import run_simulation, select_markets
+
+    console.print(f"\n[bold]Simulation Setup[/]")
+    console.print(f"  Horizon: {horizon} days before resolution")
+    console.print(f"  Target count: {count} markets")
+    console.print(f"  Category: {category or '(null — prediction markets)'}")
+    console.print(f"  Volume: >= ${min_volume:,.0f}")
+    if max_volume:
+        console.print(f"  Max volume: <= ${max_volume:,.0f}")
+    if regime:
+        console.print(f"  Regime: {regime}")
+    if dry_run:
+        console.print(f"  [yellow]DRY RUN — no LLM calls[/]")
+    console.print("")
+
+    with console.status("Selecting markets..."):
+        markets = select_markets(
+            count=count,
+            category=category,
+            volume_min=min_volume,
+            volume_max=max_volume,
+            regime=regime,
+            horizon=horizon,
+        )
+
+    if not markets:
+        console.print("[red]No eligible markets found matching filters.[/]")
+        return
+
+    console.print(f"Selected {len(markets)} markets.")
+
+    if dry_run:
+        result = run_simulation(markets, horizon=horizon, dry_run=True)
+        table = Table(title=f"Dry Run: {result['total']} markets")
+        table.add_column("ID", style="dim", max_width=16)
+        table.add_column("Question", max_width=50)
+        table.add_column("Volume", justify="right")
+        table.add_column("Price@Horizon", justify="right")
+        table.add_column("Outcome")
+
+        for m in result["markets"]:
+            table.add_row(
+                m["id"],
+                m["question"],
+                f"${m['volume']:,.0f}",
+                f"{m['price_at_horizon']:.3f}" if m["price_at_horizon"] else "N/A",
+                m["outcome"],
+            )
+        console.print(table)
+        if result["skipped"]:
+            console.print(f"[yellow]Skipped {result['skipped']} markets (no price data at horizon)[/]")
+        return
+
+    console.print("Running estimation pipeline...\n")
+    result = run_simulation(markets, horizon=horizon)
+
+    # Summary
+    console.print(f"\n[bold green]Simulation Complete (Run #{result['run_id']})[/]")
+    console.print(f"  Trials: {result['valid_trials']}/{result['market_count']}")
+    console.print(f"  Elapsed: {result['elapsed_seconds']:.0f}s")
+    console.print(f"  LLM cost: ${result['total_cost']:.4f}")
+
+    console.print(f"\n[bold]Brier Score Comparison[/]")
+    if result["agent_brier"] is not None:
+        console.print(f"  Agent:  {result['agent_brier']:.4f}")
+    console.print(f"  Market: {result['market_brier']:.4f}")
+    if result["brier_diff"] is not None:
+        diff = result["brier_diff"]
+        style = "green" if diff < 0 else "red"
+        console.print(f"  Diff:   [{style}]{diff:+.4f}[/{style}] ({'agent better' if diff < 0 else 'market better'})")
+
+    console.print(f"\n[bold]Simulated P&L[/]")
+    console.print(f"  Net P&L: ${result['simulated_pnl']:+.2f}")
+
+    console.print(f"\n[dim]View details: polymarket backtest results --run-id {result['run_id']}[/]")
+
+
+@backtest.command("results")
+@click.option("--run-id", type=int, default=None, help="Simulation run ID (default: latest)")
+def show_results(run_id: int | None):
+    """Display simulation results."""
+    from polymarket_agent.backtest.analysis import (
+        simulation_by_category,
+        simulation_by_volume_tier,
+        simulation_summary,
+    )
+    from polymarket_agent.backtest.database import get_backtest_db
+
+    # Get latest run if not specified
+    if run_id is None:
+        with get_backtest_db() as conn:
+            row = conn.execute(
+                "SELECT id FROM bt_simulation_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                console.print("[yellow]No simulation runs found. Run 'backtest simulate' first.[/]")
+                return
+            run_id = row["id"]
+
+    # Summary
+    summary = simulation_summary(run_id)
+    if "error" in summary:
+        console.print(f"[red]{summary['error']}[/]")
+        return
+
+    console.print(f"\n[bold]Simulation Run #{run_id}[/]")
+    console.print(f"  Started: {summary['started_at']}")
+    console.print(f"  Trials: {summary['valid_trials']}/{summary['trial_count']}")
+    console.print(f"  Cost: ${summary['total_cost']:.4f}")
+
+    # Brier comparison
+    console.print(f"\n[bold]Brier Score Comparison[/]")
+    if summary["agent_brier"] is not None:
+        console.print(f"  Agent:  {summary['agent_brier']:.4f}")
+    else:
+        console.print(f"  Agent:  N/A")
+    if summary["market_brier"] is not None:
+        console.print(f"  Market: {summary['market_brier']:.4f}")
+    if summary["brier_diff"] is not None:
+        diff = summary["brier_diff"]
+        style = "green" if diff < 0 else "red"
+        console.print(f"  Diff:   [{style}]{diff:+.4f}[/{style}] ({'agent better' if diff < 0 else 'market better'})")
+    if summary["valid_trials"] and summary["valid_trials"] < 10:
+        console.print(f"  [yellow]Note: insufficient sample size for reliable comparison[/]")
+
+    # P&L
+    console.print(f"\n[bold]Simulated P&L[/]")
+    console.print(f"  Net P&L: ${summary['simulated_pnl']:+.2f}")
+    console.print(f"  Trades: {summary['trade_count']}")
+    if summary["win_rate"] is not None:
+        console.print(f"  Win rate: {summary['win_rate']:.0%}")
+
+    # Category breakdown
+    by_cat = simulation_by_category(run_id)
+    if len(by_cat) > 1:
+        cat_table = Table(title="By Category")
+        cat_table.add_column("Category")
+        cat_table.add_column("Agent Brier", justify="right")
+        cat_table.add_column("Market Brier", justify="right")
+        cat_table.add_column("Diff", justify="right")
+        cat_table.add_column("Trials", justify="right")
+        cat_table.add_column("P&L", justify="right")
+
+        for cat, data in sorted(by_cat.items(), key=lambda x: x[1]["trial_count"], reverse=True):
+            diff_str = ""
+            if data["brier_diff"] is not None:
+                d = data["brier_diff"]
+                diff_str = f"[{'green' if d < 0 else 'red'}]{d:+.4f}[/]"
+            cat_table.add_row(
+                cat,
+                f"{data['agent_brier']:.4f}" if data["agent_brier"] is not None else "N/A",
+                f"{data['market_brier']:.4f}" if data["market_brier"] is not None else "N/A",
+                diff_str,
+                str(data["trial_count"]),
+                f"${data['simulated_pnl']:+.2f}",
+            )
+        console.print(cat_table)
+
+    # Volume tier breakdown
+    by_vol = simulation_by_volume_tier(run_id)
+    if len(by_vol) > 1:
+        vol_table = Table(title="By Volume Tier")
+        vol_table.add_column("Tier")
+        vol_table.add_column("Agent Brier", justify="right")
+        vol_table.add_column("Market Brier", justify="right")
+        vol_table.add_column("Diff", justify="right")
+        vol_table.add_column("Trials", justify="right")
+        vol_table.add_column("P&L", justify="right")
+
+        tier_order = [">10M", "1M-10M", "100K-1M", "10K-100K"]
+        for tier in tier_order:
+            if tier not in by_vol:
+                continue
+            data = by_vol[tier]
+            diff_str = ""
+            if data["brier_diff"] is not None:
+                d = data["brier_diff"]
+                diff_str = f"[{'green' if d < 0 else 'red'}]{d:+.4f}[/]"
+            vol_table.add_row(
+                tier,
+                f"{data['agent_brier']:.4f}" if data["agent_brier"] is not None else "N/A",
+                f"{data['market_brier']:.4f}" if data["market_brier"] is not None else "N/A",
+                diff_str,
+                str(data["trial_count"]),
+                f"${data['simulated_pnl']:+.2f}",
+            )
+        console.print(vol_table)
+
+
 if __name__ == "__main__":
     cli()

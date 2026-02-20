@@ -36,10 +36,43 @@ CREATE TABLE IF NOT EXISTS bt_regimes (
     end_date TEXT
 );
 
+CREATE TABLE IF NOT EXISTS bt_simulation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    config TEXT,
+    market_count INTEGER DEFAULT 0,
+    agent_brier REAL,
+    market_brier REAL,
+    simulated_pnl REAL,
+    total_cost REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bt_simulation_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES bt_simulation_runs(id),
+    market_id TEXT NOT NULL REFERENCES bt_markets(id),
+    horizon_days INTEGER NOT NULL,
+    market_price_at_horizon REAL,
+    agent_estimate REAL,
+    confidence_low REAL,
+    confidence_high REAL,
+    outcome REAL,
+    agent_brier REAL,
+    market_brier REAL,
+    edge REAL,
+    simulated_trade TEXT,
+    reasoning TEXT,
+    llm_cost REAL DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_bt_markets_category ON bt_markets(category);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_end_date ON bt_markets(end_date);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_volume ON bt_markets(volume);
 CREATE INDEX IF NOT EXISTS idx_bt_price_history_market ON bt_price_history(market_id);
+CREATE INDEX IF NOT EXISTS idx_bt_sim_trials_run ON bt_simulation_trials(run_id);
+CREATE INDEX IF NOT EXISTS idx_bt_sim_trials_market ON bt_simulation_trials(market_id);
 """
 
 REGIMES = [

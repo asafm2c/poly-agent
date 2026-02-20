@@ -373,6 +373,185 @@ def regime_comparison(analysis_fn, db_path: Path | None = None, **kwargs) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Simulation Results (Group 4)
+# ---------------------------------------------------------------------------
+
+
+def simulation_summary(run_id: int, db_path: Path | None = None) -> dict:
+    """Load simulation run + trials, compute aggregate metrics.
+
+    Returns dict with agent_brier, market_brier, brier_diff, simulated_pnl,
+    trade_count, win_rate, total_cost, trial_count, valid_trials.
+    """
+    import json
+
+    path = db_path or settings.backtest_db_path
+    with get_backtest_db(path) as conn:
+        run = conn.execute(
+            "SELECT * FROM bt_simulation_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if not run:
+            return {"error": f"Run {run_id} not found"}
+
+        trials = conn.execute(
+            "SELECT * FROM bt_simulation_trials WHERE run_id = ?", (run_id,)
+        ).fetchall()
+
+    total_agent_brier = 0.0
+    total_market_brier = 0.0
+    valid = 0
+    trade_count = 0
+    wins = 0
+    total_pnl = 0.0
+    total_cost = 0.0
+
+    for t in trials:
+        if t["agent_brier"] is not None:
+            total_agent_brier += t["agent_brier"]
+            valid += 1
+        if t["market_brier"] is not None:
+            total_market_brier += t["market_brier"]
+        if t["simulated_trade"]:
+            trade = json.loads(t["simulated_trade"])
+            trade_count += 1
+            total_pnl += trade.get("net_pnl", 0)
+            if trade.get("net_pnl", 0) > 0:
+                wins += 1
+        total_cost += t["llm_cost"] or 0
+
+    agent_brier = total_agent_brier / valid if valid > 0 else None
+    market_brier = total_market_brier / len(trials) if trials else None
+
+    return {
+        "run_id": run_id,
+        "started_at": run["started_at"],
+        "completed_at": run["completed_at"],
+        "trial_count": len(trials),
+        "valid_trials": valid,
+        "agent_brier": agent_brier,
+        "market_brier": market_brier,
+        "brier_diff": (agent_brier - market_brier)
+        if agent_brier is not None and market_brier is not None
+        else None,
+        "simulated_pnl": total_pnl,
+        "trade_count": trade_count,
+        "win_rate": wins / trade_count if trade_count > 0 else None,
+        "total_cost": total_cost,
+    }
+
+
+def simulation_by_category(run_id: int, db_path: Path | None = None) -> dict[str, dict]:
+    """Group simulation trials by market category.
+
+    Returns {category: {agent_brier, market_brier, brier_diff, trial_count, simulated_pnl}}.
+    """
+    import json
+
+    path = db_path or settings.backtest_db_path
+    with get_backtest_db(path) as conn:
+        trials = conn.execute(
+            """SELECT t.*, m.category, m.volume
+            FROM bt_simulation_trials t
+            JOIN bt_markets m ON t.market_id = m.id
+            WHERE t.run_id = ?""",
+            (run_id,),
+        ).fetchall()
+
+    by_cat: dict[str, dict] = {}
+    for t in trials:
+        cat = t["category"] or "(null)"
+        if cat not in by_cat:
+            by_cat[cat] = {
+                "agent_brier_sum": 0.0, "market_brier_sum": 0.0,
+                "valid": 0, "total": 0, "pnl": 0.0,
+            }
+        bucket = by_cat[cat]
+        bucket["total"] += 1
+        if t["agent_brier"] is not None:
+            bucket["agent_brier_sum"] += t["agent_brier"]
+            bucket["valid"] += 1
+        if t["market_brier"] is not None:
+            bucket["market_brier_sum"] += t["market_brier"]
+        if t["simulated_trade"]:
+            trade = json.loads(t["simulated_trade"])
+            bucket["pnl"] += trade.get("net_pnl", 0)
+
+    results = {}
+    for cat, b in by_cat.items():
+        ab = b["agent_brier_sum"] / b["valid"] if b["valid"] > 0 else None
+        mb = b["market_brier_sum"] / b["total"] if b["total"] > 0 else None
+        results[cat] = {
+            "agent_brier": ab,
+            "market_brier": mb,
+            "brier_diff": (ab - mb) if ab is not None and mb is not None else None,
+            "trial_count": b["total"],
+            "simulated_pnl": b["pnl"],
+        }
+
+    return results
+
+
+def simulation_by_volume_tier(run_id: int, db_path: Path | None = None) -> dict[str, dict]:
+    """Group simulation trials by volume tier.
+
+    Returns {tier: {agent_brier, market_brier, brier_diff, trial_count, simulated_pnl}}.
+    """
+    import json
+
+    path = db_path or settings.backtest_db_path
+    with get_backtest_db(path) as conn:
+        trials = conn.execute(
+            """SELECT t.*, m.volume
+            FROM bt_simulation_trials t
+            JOIN bt_markets m ON t.market_id = m.id
+            WHERE t.run_id = ?""",
+            (run_id,),
+        ).fetchall()
+
+    def _tier(vol):
+        if vol >= 10_000_000:
+            return ">10M"
+        elif vol >= 1_000_000:
+            return "1M-10M"
+        elif vol >= 100_000:
+            return "100K-1M"
+        return "10K-100K"
+
+    by_tier: dict[str, dict] = {}
+    for t in trials:
+        tier = _tier(t["volume"] or 0)
+        if tier not in by_tier:
+            by_tier[tier] = {
+                "agent_brier_sum": 0.0, "market_brier_sum": 0.0,
+                "valid": 0, "total": 0, "pnl": 0.0,
+            }
+        bucket = by_tier[tier]
+        bucket["total"] += 1
+        if t["agent_brier"] is not None:
+            bucket["agent_brier_sum"] += t["agent_brier"]
+            bucket["valid"] += 1
+        if t["market_brier"] is not None:
+            bucket["market_brier_sum"] += t["market_brier"]
+        if t["simulated_trade"]:
+            trade = json.loads(t["simulated_trade"])
+            bucket["pnl"] += trade.get("net_pnl", 0)
+
+    results = {}
+    for tier, b in by_tier.items():
+        ab = b["agent_brier_sum"] / b["valid"] if b["valid"] > 0 else None
+        mb = b["market_brier_sum"] / b["total"] if b["total"] > 0 else None
+        results[tier] = {
+            "agent_brier": ab,
+            "market_brier": mb,
+            "brier_diff": (ab - mb) if ab is not None and mb is not None else None,
+            "trial_count": b["total"],
+            "simulated_pnl": b["pnl"],
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

@@ -761,3 +761,465 @@ class TestStrategyDriftMonitoring:
         # This exceeds 0.25 + 0.05 = 0.30, so drift should be flagged
         drift = rows[0]["brier"] - 0.25
         assert drift > 0.05
+
+
+# ---------------------------------------------------------------------------
+# Simulation Harness Tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_simulation_markets(db_path):
+    """Seed backtest DB with test markets and price histories for simulation tests."""
+    from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+    init_backtest_db(db_path)
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Market resolves in ~30 days, so horizon=7 means 23 days of price data is visible
+    end_date = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    end_ts = int((datetime.now(timezone.utc) - timedelta(days=5)).timestamp())
+
+    with get_backtest_db(db_path) as conn:
+        # Market 1: YES resolution, price=0.60 at 7d horizon
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, description, category, end_date,
+                volume, liquidity, resolution_outcome, yes_token, no_token,
+                has_history, collected_at, event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                "sim-market-1", "Will X happen?", "Test description", None,
+                end_date, 500000, 10000, "YES", "token1", "token2",
+                now, None,
+            ),
+        )
+        # Price history: daily for 30 days, price drifts from 0.50 to 0.60
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            price = 0.50 + (30 - d) * 0.003  # 0.50 → 0.59
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("sim-market-1", ts, round(price, 3)),
+            )
+
+        # Market 2: NO resolution, price=0.70 at 7d horizon
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, description, category, end_date,
+                volume, liquidity, resolution_outcome, yes_token, no_token,
+                has_history, collected_at, event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                "sim-market-2", "Will Y happen?", "Another test", None,
+                end_date, 2000000, 50000, "NO", "token3", "token4",
+                now, None,
+            ),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            price = 0.65 + (30 - d) * 0.002  # 0.65 → 0.72
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("sim-market-2", ts, round(price, 3)),
+            )
+
+        # Market 3: YES, low volume, crypto category (for filter testing)
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, description, category, end_date,
+                volume, liquidity, resolution_outcome, yes_token, no_token,
+                has_history, collected_at, event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                "sim-market-3", "Crypto question?", "Crypto desc", "crypto", end_date,
+                50000, 5000, "YES", "token5", "token6",
+                now, None,
+            ),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("sim-market-3", ts, 0.40),
+            )
+
+
+class TestSimulationSchema:
+    """6.6 Test schema: simulation tables created correctly."""
+
+    def test_tables_created(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            table_names = [t["name"] for t in tables]
+
+        assert "bt_simulation_runs" in table_names
+        assert "bt_simulation_trials" in table_names
+
+    def test_run_insert(self):
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                """INSERT INTO bt_simulation_runs (started_at, config, market_count)
+                VALUES (?, ?, ?)""",
+                ("2024-01-01T00:00:00Z", '{"horizon": 7}', 10),
+            )
+            row = conn.execute("SELECT * FROM bt_simulation_runs WHERE id = 1").fetchone()
+
+        assert row["market_count"] == 10
+        assert row["started_at"] == "2024-01-01T00:00:00Z"
+
+
+class TestHistoricalResearchGatherer:
+    """6.1 Test HistoricalResearchGatherer."""
+
+    def test_gather_returns_dossier(self):
+        from polymarket_agent.backtest.simulator import HistoricalResearchGatherer
+        from polymarket_agent.models import Market
+
+        market = Market(
+            id="test-1",
+            question="Will it rain?",
+            description="Test market",
+            category="weather",
+            last_price_yes=0.55,
+        )
+        market._price_history_for_dossier = [
+            {"t": 1000000, "p": 0.50},
+            {"t": 1086400, "p": 0.55},
+        ]
+
+        gatherer = HistoricalResearchGatherer()
+        dossier = gatherer.gather(market)
+
+        assert dossier.market_id == "test-1"
+        assert dossier.market_question == "Will it rain?"
+        assert dossier.current_price_yes == 0.55
+        assert len(dossier.web_search_results) == 0
+        assert len(dossier.polymarket_comments) == 0
+        assert dossier.order_book_signals is None
+        assert len(dossier.price_history) == 2
+
+    def test_format_dossier_contains_price_summary(self):
+        from polymarket_agent.backtest.simulator import HistoricalResearchGatherer
+        from polymarket_agent.models import Market
+
+        market = Market(
+            id="test-2",
+            question="Will BTC hit 100k?",
+            last_price_yes=0.60,
+            category="crypto",
+        )
+        market._price_history_for_dossier = [
+            {"t": i * 86400, "p": 0.50 + i * 0.01} for i in range(10)
+        ]
+
+        gatherer = HistoricalResearchGatherer()
+        dossier = gatherer.gather(market)
+        text = gatherer.format_dossier_for_llm(dossier)
+
+        assert "Will BTC hit 100k?" in text
+        assert "Price History" in text
+        assert "Open:" in text
+        assert "web search results" in text.lower() or "Web search" in text
+
+    def test_horizon_truncation(self):
+        from polymarket_agent.backtest.simulator import build_market_at_horizon
+
+        end_ts = int(datetime(2024, 6, 30, tzinfo=timezone.utc).timestamp())
+        market_dict = {
+            "id": "trunc-test",
+            "question": "Test?",
+            "end_date": "2024-06-30T00:00:00+00:00",
+            "volume": 100000,
+            "price_history": [
+                {"t": end_ts - 20 * 86400, "p": 0.40},  # 20 days before
+                {"t": end_ts - 10 * 86400, "p": 0.50},  # 10 days before
+                {"t": end_ts - 5 * 86400, "p": 0.60},   # 5 days before (after horizon=7)
+                {"t": end_ts - 1 * 86400, "p": 0.90},   # 1 day before (after horizon=7)
+            ],
+        }
+
+        result = build_market_at_horizon(market_dict, horizon=7)
+        assert result is not None
+        market_obj, truncated = result
+
+        # Only prices at 20d and 10d should survive (both before 7d horizon)
+        assert len(truncated) == 2
+        assert market_obj.last_price_yes == 0.50  # Last price before cutoff
+
+
+class TestSelectMarkets:
+    """6.2 Test select_markets()."""
+
+    def test_respects_volume_filter(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        # min_volume=100000 should get market 1 (500K) and 2 (2M), not 3 (50K)
+        markets = select_markets(
+            count=10, volume_min=100000, db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "sim-market-1" in ids
+        assert "sim-market-2" in ids
+        assert "sim-market-3" not in ids
+
+    def test_respects_category_filter(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        markets = select_markets(
+            count=10, category="crypto", volume_min=0, db_path=TEST_BACKTEST_DB
+        )
+        assert len(markets) == 1
+        assert markets[0]["id"] == "sim-market-3"
+
+    def test_respects_count_limit(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        markets = select_markets(count=1, volume_min=0, db_path=TEST_BACKTEST_DB)
+        assert len(markets) == 1
+
+
+class TestSimulatedPnL:
+    """6.3 Test simulated P&L computation."""
+
+    def test_yes_trade_correct_outcome(self):
+        from polymarket_agent.backtest.simulator import compute_simulated_trade
+
+        trade = compute_simulated_trade(
+            agent_estimate=0.80, market_price=0.55, outcome=1.0,
+            edge_threshold=0.10, bankroll=1000, fee_rate=0.02,
+        )
+        assert trade is not None
+        assert trade["side"] == "YES"
+        assert trade["entry_price"] == 0.55
+        assert trade["exit_price"] == 1.0
+        assert trade["net_pnl"] > 0
+
+    def test_yes_trade_wrong_outcome(self):
+        from polymarket_agent.backtest.simulator import compute_simulated_trade
+
+        trade = compute_simulated_trade(
+            agent_estimate=0.80, market_price=0.55, outcome=0.0,
+            edge_threshold=0.10, bankroll=1000, fee_rate=0.02,
+        )
+        assert trade is not None
+        assert trade["side"] == "YES"
+        assert trade["net_pnl"] < 0
+
+    def test_no_trade_below_threshold(self):
+        from polymarket_agent.backtest.simulator import compute_simulated_trade
+
+        trade = compute_simulated_trade(
+            agent_estimate=0.56, market_price=0.55, outcome=1.0,
+            edge_threshold=0.10,
+        )
+        assert trade is None
+
+    def test_no_side_trade(self):
+        from polymarket_agent.backtest.simulator import compute_simulated_trade
+
+        trade = compute_simulated_trade(
+            agent_estimate=0.30, market_price=0.55, outcome=0.0,
+            edge_threshold=0.10, bankroll=1000, fee_rate=0.02,
+        )
+        assert trade is not None
+        assert trade["side"] == "NO"
+        assert trade["net_pnl"] > 0  # Correct: bought NO, resolved NO
+
+    def test_fee_deduction(self):
+        from polymarket_agent.backtest.simulator import compute_simulated_trade
+
+        trade = compute_simulated_trade(
+            agent_estimate=0.80, market_price=0.55, outcome=1.0,
+            edge_threshold=0.10, bankroll=1000, fee_rate=0.02,
+        )
+        assert trade is not None
+        assert trade["fees"] > 0
+        assert trade["net_pnl"] < trade["gross_pnl"]
+
+
+class TestSimulationSummary:
+    """6.4 Test simulation_summary()."""
+
+    def test_aggregation(self):
+        from polymarket_agent.backtest.analysis import simulation_summary
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        # Insert a run and trials
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                """INSERT INTO bt_simulation_runs (id, started_at, config, market_count)
+                VALUES (1, '2024-01-01', '{}', 2)""",
+            )
+            # Trial 1: agent=0.80, market=0.60, outcome=1.0 (YES)
+            conn.execute(
+                """INSERT INTO bt_simulation_trials
+                (run_id, market_id, horizon_days, market_price_at_horizon,
+                 agent_estimate, outcome, agent_brier, market_brier, edge,
+                 simulated_trade, llm_cost, duration_ms)
+                VALUES (1, 'sim-market-1', 7, 0.60, 0.80, 1.0, 0.04, 0.16, 0.20,
+                '{"net_pnl": 50.0}', 0.03, 5000)""",
+            )
+            # Trial 2: agent=0.40, market=0.70, outcome=0.0 (NO)
+            conn.execute(
+                """INSERT INTO bt_simulation_trials
+                (run_id, market_id, horizon_days, market_price_at_horizon,
+                 agent_estimate, outcome, agent_brier, market_brier, edge,
+                 simulated_trade, llm_cost, duration_ms)
+                VALUES (1, 'sim-market-2', 7, 0.70, 0.40, 0.0, 0.16, 0.49, -0.30,
+                '{"net_pnl": -20.0}', 0.02, 4000)""",
+            )
+
+        summary = simulation_summary(1, db_path=TEST_BACKTEST_DB)
+
+        assert summary["trial_count"] == 2
+        assert summary["valid_trials"] == 2
+        assert abs(summary["agent_brier"] - 0.10) < 0.01  # (0.04+0.16)/2
+        assert abs(summary["market_brier"] - 0.325) < 0.01  # (0.16+0.49)/2
+        assert summary["brier_diff"] < 0  # Agent is better
+        assert abs(summary["simulated_pnl"] - 30.0) < 0.01  # 50 - 20
+        assert summary["trade_count"] == 2
+        assert summary["total_cost"] == 0.05
+
+
+class TestSimulationByGrouping:
+    """6.5 Test simulation_by_category() and simulation_by_volume_tier()."""
+
+    def test_by_volume_tier(self):
+        from polymarket_agent.backtest.analysis import simulation_by_volume_tier
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                """INSERT INTO bt_simulation_runs (id, started_at, config, market_count)
+                VALUES (1, '2024-01-01', '{}', 2)""",
+            )
+            # sim-market-1 has vol=500K (100K-1M tier)
+            conn.execute(
+                """INSERT INTO bt_simulation_trials
+                (run_id, market_id, horizon_days, market_price_at_horizon,
+                 agent_estimate, outcome, agent_brier, market_brier, edge,
+                 llm_cost, duration_ms)
+                VALUES (1, 'sim-market-1', 7, 0.60, 0.80, 1.0, 0.04, 0.16, 0.20,
+                0.03, 5000)""",
+            )
+            # sim-market-2 has vol=2M (1M-10M tier)
+            conn.execute(
+                """INSERT INTO bt_simulation_trials
+                (run_id, market_id, horizon_days, market_price_at_horizon,
+                 agent_estimate, outcome, agent_brier, market_brier, edge,
+                 llm_cost, duration_ms)
+                VALUES (1, 'sim-market-2', 7, 0.70, 0.40, 0.0, 0.16, 0.49, -0.30,
+                0.02, 4000)""",
+            )
+
+        by_vol = simulation_by_volume_tier(1, db_path=TEST_BACKTEST_DB)
+        assert "100K-1M" in by_vol
+        assert "1M-10M" in by_vol
+        assert by_vol["100K-1M"]["trial_count"] == 1
+        assert by_vol["1M-10M"]["trial_count"] == 1
+
+
+class TestDryRun:
+    """6.7 Test dry-run mode."""
+
+    def test_no_db_records(self):
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        markets = [
+            {
+                "id": "sim-market-1", "question": "Will X happen?",
+                "end_date": (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(),
+                "volume": 500000, "resolution_outcome": "YES",
+                "price_history": [{"t": int(datetime.now(timezone.utc).timestamp()) - d * 86400, "p": 0.55} for d in range(30, 0, -1)],
+            },
+        ]
+
+        result = run_simulation(markets, dry_run=True, db_path=TEST_BACKTEST_DB)
+        assert result["dry_run"] is True
+
+        # No run records should exist
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            count = conn.execute("SELECT COUNT(*) as c FROM bt_simulation_runs").fetchone()["c"]
+        assert count == 0
+
+
+class TestEstimationErrorHandling:
+    """6.8 Test estimation error handling."""
+
+    def test_continues_after_error(self):
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.simulator import (
+            HistoricalResearchGatherer,
+            run_simulation,
+        )
+
+        _seed_simulation_markets(TEST_BACKTEST_DB)
+
+        # Create markets list
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            rows = conn.execute(
+                "SELECT * FROM bt_markets WHERE id IN ('sim-market-1', 'sim-market-2')"
+            ).fetchall()
+            markets = []
+            for row in rows:
+                m = dict(row)
+                history = conn.execute(
+                    "SELECT timestamp as t, price as p FROM bt_price_history WHERE market_id = ?",
+                    (row["id"],),
+                ).fetchall()
+                m["price_history"] = [{"t": h["t"], "p": h["p"]} for h in history]
+                markets.append(m)
+
+        # Mock the estimator to raise on first call, succeed on second
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_estimator = MagicMock()
+            mock_estimate = MagicMock()
+            mock_estimate.final_estimate = 0.70
+            mock_estimate.confidence_low = 0.60
+            mock_estimate.confidence_high = 0.80
+            mock_estimate.thesis = "Test thesis"
+            mock_estimator.estimate.side_effect = [Exception("LLM error"), mock_estimate]
+            mock_est_cls.return_value = mock_estimator
+
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm = MagicMock()
+                mock_llm.get_usage_summary.return_value = {"estimated_cost": 0.0}
+                mock_llm_cls.return_value = mock_llm
+
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB)
+
+        # Should have completed both trials (one with error, one success)
+        assert result["market_count"] == 2
+        assert result["valid_trials"] == 1  # Only 1 succeeded
+
+        # Check that trial with error has NULL estimate
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            trials = conn.execute(
+                "SELECT * FROM bt_simulation_trials WHERE run_id = ?",
+                (result["run_id"],),
+            ).fetchall()
+        assert len(trials) == 2
+        estimates = [t["agent_estimate"] for t in trials]
+        assert None in estimates  # One should be NULL
