@@ -231,9 +231,11 @@ async def evaluation_temporal(request: Request, run_id: int):
             (run_id,),
         )
 
-        regimes = await conn.execute_fetchall(
-            "SELECT name, start_date, end_date FROM bt_regimes ORDER BY start_date"
-        )
+        regimes = []
+        if await conn.table_exists("bt_regimes"):
+            regimes = await conn.execute_fetchall(
+                "SELECT name, start_date, end_date FROM bt_regimes ORDER BY start_date"
+            )
 
     # Compute rolling Brier diff (10-trial window)
     data = []

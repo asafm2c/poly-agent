@@ -429,8 +429,8 @@ def run_simulation(
         "fee_rate": fee_rate,
         "market_count": len(markets),
     }
-    if model:
-        config["model"] = model
+    effective_model = model or settings.analysis_model
+    config["model"] = effective_model
     if hypothesis_id is not None:
         config["hypothesis_id"] = hypothesis_id
 
@@ -517,10 +517,10 @@ def run_simulation(
 
         # Compute training recency score
         recency_score = None
-        if model and market_dict.get("end_date"):
+        if market_dict.get("end_date"):
             from polymarket_agent.backtest.analysis import training_recency_score
             try:
-                recency_score = training_recency_score(market_dict["end_date"], model)
+                recency_score = training_recency_score(market_dict["end_date"], effective_model)
             except Exception:
                 pass
 
@@ -539,7 +539,7 @@ def run_simulation(
                     agent_brier, market_brier, edge,
                     json.dumps(trade) if trade else None,
                     reasoning, trial_cost, trial_duration,
-                    model, recency_score,
+                    effective_model, recency_score,
                 ),
             )
 
@@ -591,6 +591,12 @@ def run_simulation(
             supports = None
             if brier_diff is not None and valid_trials >= 5:
                 supports = 1 if brier_diff < 0 else 0
+
+            # Compute paired stats for p-value
+            p_value, effect_size = None, None
+            if valid_trials >= 5:
+                p_value, effect_size = _compute_paired_stats(run_id, path)
+
             record_evidence(
                 hypothesis_id=hypothesis_id,
                 run_id=run_id,
@@ -599,6 +605,8 @@ def run_simulation(
                 market_brier=avg_market_brier,
                 brier_diff=brier_diff,
                 simulated_pnl=total_pnl,
+                p_value=p_value,
+                effect_size=effect_size,
                 supports_hypothesis=supports,
                 db_path=path,
             )
@@ -618,6 +626,39 @@ def run_simulation(
         "total_cost": total_cost,
         "elapsed_seconds": time.time() - start_time,
     }
+
+
+def _compute_paired_stats(run_id: int, db_path: Path) -> tuple[float | None, float | None]:
+    """Compute paired t-test p-value and Cohen's d from per-trial Brier scores."""
+    with get_backtest_db(db_path) as conn:
+        rows = conn.execute(
+            """SELECT agent_brier, market_brier
+            FROM bt_simulation_trials
+            WHERE run_id = ? AND agent_brier IS NOT NULL AND market_brier IS NOT NULL""",
+            (run_id,),
+        ).fetchall()
+
+    if len(rows) < 5:
+        return None, None
+
+    diffs = [r["agent_brier"] - r["market_brier"] for r in rows]
+    n = len(diffs)
+    mean_diff = sum(diffs) / n
+    var_diff = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
+    sd_diff = math.sqrt(var_diff) if var_diff > 0 else 0.001
+
+    # t-statistic
+    t_stat = mean_diff / (sd_diff / math.sqrt(n))
+
+    # Two-tailed p-value using normal approximation (accurate for n >= 30)
+    z = abs(t_stat)
+    # Approximation using math.erfc: p = erfc(z / sqrt(2))
+    p_value = math.erfc(z / math.sqrt(2))
+
+    # Cohen's d
+    effect_size = mean_diff / sd_diff if sd_diff > 0 else 0.0
+
+    return p_value, effect_size
 
 
 def _dry_run(markets: list[dict], horizon: int, config: dict) -> dict:

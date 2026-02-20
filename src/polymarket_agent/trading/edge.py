@@ -214,6 +214,15 @@ def build_recommendation(
         current_exposure=current_exposure,
     )
 
+    # Apply hypothesis weight_adjustment actions
+    if strategy_config:
+        for ha in strategy_config.get("hypothesis_actions", []):
+            if ha.get("action_type") == "weight_adjustment":
+                cfg = ha.get("config", {})
+                strength = ha.get("effective_strength", 0.0)
+                multiplier = 1.0 + (cfg.get("kelly_multiplier", 1.0) - 1.0) * strength
+                size = round(size * multiplier, 2)
+
     if size < 1.0:  # Minimum $1 trade
         return None, adjusted_edge, required_edge
 

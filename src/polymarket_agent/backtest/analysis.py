@@ -895,9 +895,40 @@ def cross_model_comparison(
                 "sufficient": n >= 20,
             }
 
+    # Per-cell (category x volume tier) breakdown
+    by_cell = {}
+    for model, data in runs_data.items():
+        for t in data["trials"]:
+            if t.get("agent_brier") is None:
+                continue
+            cat = t.get("category") or "(null)"
+            tier = _volume_tier(t.get("volume", 0) or 0)
+            cell_key = f"{cat}|{tier}"
+            if cell_key not in by_cell:
+                by_cell[cell_key] = {}
+            if model not in by_cell[cell_key]:
+                by_cell[cell_key][model] = {"ab_sum": 0.0, "mb_sum": 0.0, "n": 0}
+            by_cell[cell_key][model]["ab_sum"] += t["agent_brier"]
+            by_cell[cell_key][model]["mb_sum"] += t.get("market_brier", 0)
+            by_cell[cell_key][model]["n"] += 1
+
+    by_cell_result = {}
+    for cell_key, models_in_cell in by_cell.items():
+        by_cell_result[cell_key] = {}
+        for model, agg in models_in_cell.items():
+            n = agg["n"]
+            by_cell_result[cell_key][model] = {
+                "agent_brier": agg["ab_sum"] / n,
+                "market_brier": agg["mb_sum"] / n,
+                "brier_diff": (agg["ab_sum"] - agg["mb_sum"]) / n,
+                "n": n,
+                "sufficient": n >= 20,
+            }
+
     return {
         "models": models_summary,
         "pairwise": pairwise,
         "by_category": by_category_result,
         "by_volume_tier": by_tier_result,
+        "by_cell": by_cell_result,
     }
