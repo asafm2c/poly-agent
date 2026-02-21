@@ -1226,9 +1226,9 @@ class TestEstimationErrorHandling:
 
 
 class TestPerTrialCostDelta:
-    """6.9 Test that per-trial LLM cost records the delta, not cumulative."""
+    """6.9 Test that run-level total cost comes from LLM usage summary."""
 
-    def test_cost_delta_per_trial(self):
+    def test_run_total_cost_from_llm_summary(self):
         from polymarket_agent.backtest.database import get_backtest_db
         from polymarket_agent.backtest.simulator import run_simulation
 
@@ -1248,7 +1248,6 @@ class TestPerTrialCostDelta:
                 m["price_history"] = [{"t": h["t"], "p": h["p"]} for h in history]
                 markets.append(m)
 
-        # Mock estimator — LLM cost increases cumulatively: 0.03, then 0.07
         with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
             mock_estimator = MagicMock()
             mock_estimate = MagicMock()
@@ -1261,28 +1260,13 @@ class TestPerTrialCostDelta:
 
             with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
                 mock_llm = MagicMock()
-                # Simulate cumulative cost: 0.03 after trial 1, 0.07 after trial 2
-                mock_llm.get_usage_summary.side_effect = [
-                    {"estimated_cost": 0.03},
-                    {"estimated_cost": 0.07},
-                ]
+                # Total accumulated cost reported by the shared LLM client
+                mock_llm.get_usage_summary.return_value = {"estimated_cost": 0.07}
                 mock_llm_cls.return_value = mock_llm
 
                 result = run_simulation(markets, db_path=TEST_BACKTEST_DB)
 
-        # Per-trial costs should be deltas: 0.03 and 0.04
-        with get_backtest_db(TEST_BACKTEST_DB) as conn:
-            trials = conn.execute(
-                "SELECT llm_cost FROM bt_simulation_trials WHERE run_id = ? ORDER BY id",
-                (result["run_id"],),
-            ).fetchall()
-
-        costs = [t["llm_cost"] for t in trials]
-        assert len(costs) == 2
-        assert abs(costs[0] - 0.03) < 0.001
-        assert abs(costs[1] - 0.04) < 0.001
-
-        # Run-level total should equal sum of deltas
+        # Run-level total should come from LLM usage summary
         assert abs(result["total_cost"] - 0.07) < 0.001
 
 
@@ -1834,3 +1818,240 @@ class TestHypothesisCLI:
         runner = CliRunner()
         result = runner.invoke(cli, ["backtest", "hypothesis", "decay-check"])
         assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Parallel Trial Execution Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_markets(db_path, market_ids=("sim-market-1", "sim-market-2")):
+    """Helper: load seeded markets with price history for simulation tests."""
+    from polymarket_agent.backtest.database import get_backtest_db
+    _seed_simulation_markets(db_path)
+    with get_backtest_db(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM bt_markets WHERE id IN ({','.join('?' for _ in market_ids)})",
+            list(market_ids),
+        ).fetchall()
+        markets = []
+        for row in rows:
+            m = dict(row)
+            history = conn.execute(
+                "SELECT timestamp as t, price as p FROM bt_price_history WHERE market_id = ?",
+                (row["id"],),
+            ).fetchall()
+            m["price_history"] = [{"t": h["t"], "p": h["p"]} for h in history]
+            markets.append(m)
+    return markets
+
+
+def _mock_estimator_and_llm():
+    """Return (mock_estimate, mock_estimator, mock_llm) for patching."""
+    mock_estimate = MagicMock()
+    mock_estimate.final_estimate = 0.70
+    mock_estimate.confidence_low = 0.60
+    mock_estimate.confidence_high = 0.80
+    mock_estimate.thesis = "Test thesis"
+    mock_estimator = MagicMock()
+    mock_estimator.estimate.return_value = mock_estimate
+    mock_llm = MagicMock()
+    mock_llm.get_usage_summary.return_value = {"estimated_cost": 0.01}
+    return mock_estimate, mock_estimator, mock_llm
+
+
+class TestParallelSimulation:
+    """Tests for parallel trial execution in run_simulation()."""
+
+    def test_concurrency_1_produces_correct_results(self):
+        """6.2: concurrency=1 produces same trial count and run record as before."""
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        markets = _make_mock_markets(TEST_BACKTEST_DB)
+        _, mock_estimator, mock_llm = _mock_estimator_and_llm()
+
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_est_cls.return_value = mock_estimator
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm_cls.return_value = mock_llm
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB, concurrency=1)
+
+        assert result["market_count"] == 2
+        assert result["valid_trials"] == 2
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            trial_count = conn.execute(
+                "SELECT COUNT(*) as c FROM bt_simulation_trials WHERE run_id = ?",
+                (result["run_id"],),
+            ).fetchone()["c"]
+        assert trial_count == 2
+
+    def test_concurrency_default_runs_successfully(self):
+        """6.1: async trial dispatch works end-to-end with default concurrency."""
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        markets = _make_mock_markets(TEST_BACKTEST_DB)
+        _, mock_estimator, mock_llm = _mock_estimator_and_llm()
+
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_est_cls.return_value = mock_estimator
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm_cls.return_value = mock_llm
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB)
+
+        assert result["valid_trials"] == 2
+        assert result["run_id"] is not None
+
+    def test_failed_trial_does_not_abort_run(self):
+        """6.8: a trial that raises does not abort remaining trials."""
+        from polymarket_agent.backtest.database import get_backtest_db
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        markets = _make_mock_markets(TEST_BACKTEST_DB)
+        mock_estimate, mock_estimator, mock_llm = _mock_estimator_and_llm()
+        mock_estimator.estimate.side_effect = [Exception("LLM error"), mock_estimate]
+
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_est_cls.return_value = mock_estimator
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm_cls.return_value = mock_llm
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB, concurrency=1)
+
+        assert result["market_count"] == 2
+        assert result["valid_trials"] == 1
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            trials = conn.execute(
+                "SELECT agent_estimate FROM bt_simulation_trials WHERE run_id = ?",
+                (result["run_id"],),
+            ).fetchall()
+        estimates = [t["agent_estimate"] for t in trials]
+        assert len(trials) == 2
+        assert None in estimates
+
+    def test_concurrency_parameter_passed_to_simulation(self):
+        """6.3: concurrency param is accepted and passed through without error."""
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        markets = _make_mock_markets(TEST_BACKTEST_DB)
+        _, mock_estimator, mock_llm = _mock_estimator_and_llm()
+
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_est_cls.return_value = mock_estimator
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm_cls.return_value = mock_llm
+                # Should not raise regardless of concurrency value
+                result = run_simulation(markets, db_path=TEST_BACKTEST_DB, concurrency=3)
+
+        assert result["valid_trials"] == 2
+
+
+class TestLLMClientRetry:
+    """Tests for LLMClient retry and backoff logic."""
+
+    def test_retry_on_rate_limit_error(self):
+        """6.4: RateLimitError triggers retry up to max_retries."""
+        from polymarket_agent.analyst.llm_client import LLMClient
+
+        with patch("polymarket_agent.config.settings.anthropic_api_key", "test-key"):
+            with patch("polymarket_agent.config.settings.llm_max_retries", 2):
+                with patch("polymarket_agent.config.settings.llm_retry_base_delay", 0.01):
+                    client = LLMClient(api_key="test-key")
+                    mock_response = MagicMock()
+                    mock_response.content = [MagicMock(text="response")]
+                    mock_response.usage.input_tokens = 10
+                    mock_response.usage.output_tokens = 5
+
+                    class FakeRateLimitError(Exception):
+                        pass
+
+                    # Fail twice, succeed on third
+                    client._client.messages.create = MagicMock(
+                        side_effect=[
+                            FakeRateLimitError(),
+                            FakeRateLimitError(),
+                            mock_response,
+                        ]
+                    )
+                    with patch("polymarket_agent.analyst.llm_client.RateLimitError", FakeRateLimitError):
+                        with patch("time.sleep"):
+                            result = client.complete("test prompt")
+                    assert result == "response"
+                    assert client._client.messages.create.call_count == 3
+
+    def test_retry_on_overloaded_error(self):
+        """6.5: overloaded_error APIError triggers retry when llm_retry_on_overloaded=True."""
+        from polymarket_agent.analyst.llm_client import LLMClient
+
+        with patch("polymarket_agent.config.settings.anthropic_api_key", "test-key"):
+            with patch("polymarket_agent.config.settings.llm_max_retries", 1):
+                with patch("polymarket_agent.config.settings.llm_retry_base_delay", 0.01):
+                    with patch("polymarket_agent.config.settings.llm_retry_on_overloaded", True):
+                        client = LLMClient(api_key="test-key")
+                        mock_response = MagicMock()
+                        mock_response.content = [MagicMock(text="response")]
+                        mock_response.usage.input_tokens = 10
+                        mock_response.usage.output_tokens = 5
+
+                        # Build a real-ish APIError subclass that our code detects
+                        class OverloadedError(Exception):
+                            status_code = 529
+                            type = "overloaded_error"
+
+                        client._client.messages.create = MagicMock(
+                            side_effect=[OverloadedError(), mock_response]
+                        )
+                        # Patch the isinstance check in llm_client to treat OverloadedError as APIError
+                        with patch("polymarket_agent.analyst.llm_client.APIError", OverloadedError):
+                            with patch("time.sleep"):
+                                result = client.complete("test prompt")
+                        assert result == "response"
+                        assert client._client.messages.create.call_count == 2
+
+    def test_non_retryable_error_raises_immediately(self):
+        """6.6: non-transient 400 error raises without retrying."""
+        from polymarket_agent.analyst.llm_client import LLMClient
+
+        with patch("polymarket_agent.config.settings.anthropic_api_key", "test-key"):
+            with patch("polymarket_agent.config.settings.llm_max_retries", 3):
+                client = LLMClient(api_key="test-key")
+
+                class BadRequestError(Exception):
+                    status_code = 400
+                    type = "invalid_request_error"
+
+                client._client.messages.create = MagicMock(side_effect=BadRequestError())
+                with patch("polymarket_agent.analyst.llm_client.APIError", BadRequestError):
+                    with pytest.raises(BadRequestError):
+                        client.complete("test prompt")
+                # Should have only tried once (no retries for 400)
+                assert client._client.messages.create.call_count == 1
+
+    def test_thread_safe_counter_accumulation(self):
+        """6.7: concurrent calls from multiple threads accumulate cost correctly."""
+        import threading
+        from polymarket_agent.analyst.llm_client import LLMClient
+
+        client = LLMClient(api_key="test-key")
+
+        # Each thread makes one call with 100 input + 50 output tokens
+        def make_call():
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text="response")]
+            mock_response.usage.input_tokens = 100
+            mock_response.usage.output_tokens = 50
+            with patch.object(client._client.messages, "create", return_value=mock_response):
+                with patch("polymarket_agent.config.settings.analysis_model", "claude-sonnet-4-6"):
+                    client.complete("test")
+
+        threads = [threading.Thread(target=make_call) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        summary = client.get_usage_summary()
+        assert summary["calls"] == 5
+        assert summary["input_tokens"] == 500
+        assert summary["output_tokens"] == 250

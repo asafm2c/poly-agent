@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     # --- Order Management ---
     order_timeout_seconds: int = 3600  # 1 hour
 
+    # --- Simulation / Backtest ---
+    simulation_concurrency: int = 5  # Max parallel trials in backtest simulation
+    llm_max_retries: int = 3  # Max retries on transient LLM errors
+    llm_retry_base_delay: float = 1.0  # Base delay (seconds) for retry backoff
+    llm_retry_on_overloaded: bool = True  # Retry on overloaded_error in addition to 429
+
     # --- Storage ---
     db_path: Path = Path("polymarket_agent.db")
     backtest_db_path: Path = Path("backtest.db")

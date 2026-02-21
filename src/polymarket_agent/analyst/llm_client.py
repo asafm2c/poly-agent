@@ -2,6 +2,8 @@
 
 import json
 import logging
+import random
+import threading
 import time
 
 from anthropic import Anthropic, APIError, RateLimitError
@@ -25,6 +27,7 @@ class LLMClient:
         if not key:
             raise ValueError("Anthropic API key not configured")
         self._client = Anthropic(api_key=key)
+        self._lock = threading.Lock()
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost = 0.0
@@ -37,13 +40,14 @@ class LLMClient:
         system: str | None = None,
         max_tokens: int = 2048,
         temperature: float = 0.3,
-        retries: int = 2,
+        retries: int | None = None,
     ) -> str:
         """Send a prompt to Claude and return the response text."""
         model = model or settings.analysis_model
+        max_retries = retries if retries is not None else settings.llm_max_retries
         messages = [{"role": "user", "content": prompt}]
 
-        for attempt in range(retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 kwargs = {
                     "model": model,
@@ -58,14 +62,14 @@ class LLMClient:
                 response = self._client.messages.create(**kwargs)
                 latency_ms = int((time.monotonic() - t0) * 1000)
 
-                # Track usage
+                # Track usage (thread-safe)
                 usage = response.usage
-                self.total_input_tokens += usage.input_tokens
-                self.total_output_tokens += usage.output_tokens
-                self.call_count += 1
-
                 cost = self._estimate_cost(model, usage.input_tokens, usage.output_tokens)
-                self.total_cost += cost
+                with self._lock:
+                    self.total_input_tokens += usage.input_tokens
+                    self.total_output_tokens += usage.output_tokens
+                    self.call_count += 1
+                    self.total_cost += cost
 
                 text = response.content[0].text
                 logger.debug(
@@ -85,20 +89,31 @@ class LLMClient:
 
             except RateLimitError:
                 metrics.record("api_error", service="anthropic", error="rate_limit", model=model)
-                if attempt < retries:
-                    wait = 2 ** (attempt + 1)
-                    logger.warning("Rate limited, waiting %ds before retry", wait)
+                if attempt < max_retries:
+                    wait = self._backoff_wait(attempt)
+                    logger.warning("Rate limited, waiting %.1fs before retry (attempt %d/%d)", wait, attempt + 1, max_retries)
                     time.sleep(wait)
                 else:
                     raise
             except APIError as e:
                 metrics.record("api_error", service="anthropic", error=str(e.status_code), model=model)
-                if attempt < retries and e.status_code and e.status_code >= 500:
-                    wait = 2 ** (attempt + 1)
-                    logger.warning("API error %s, retrying in %ds", e.status_code, wait)
+                is_overloaded = hasattr(e, "type") and e.type == "overloaded_error"
+                is_server_error = e.status_code is not None and e.status_code >= 500
+                should_retry = is_server_error or (is_overloaded and settings.llm_retry_on_overloaded)
+                if attempt < max_retries and should_retry:
+                    wait = self._backoff_wait(attempt)
+                    logger.warning("API error %s, retrying in %.1fs (attempt %d/%d)", e.status_code, wait, attempt + 1, max_retries)
                     time.sleep(wait)
                 else:
                     raise
+
+    @staticmethod
+    def _backoff_wait(attempt: int) -> float:
+        """Exponential backoff with full jitter: min(60, base * 2^attempt) * uniform(0.5, 1.5)."""
+        base = settings.llm_retry_base_delay
+        cap = 60.0
+        wait = min(cap, base * (2 ** attempt)) * random.uniform(0.5, 1.5)
+        return wait
 
     def complete_json(
         self,
@@ -184,9 +199,10 @@ class LLMClient:
         return (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
 
     def get_usage_summary(self) -> dict:
-        return {
-            "calls": self.call_count,
-            "input_tokens": self.total_input_tokens,
-            "output_tokens": self.total_output_tokens,
-            "estimated_cost": round(self.total_cost, 4),
-        }
+        with self._lock:
+            return {
+                "calls": self.call_count,
+                "input_tokens": self.total_input_tokens,
+                "output_tokens": self.total_output_tokens,
+                "estimated_cost": round(self.total_cost, 4),
+            }

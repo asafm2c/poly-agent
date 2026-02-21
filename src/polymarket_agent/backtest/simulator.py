@@ -1,9 +1,11 @@
 """Simulation harness: run estimation pipeline against historical markets."""
 
+import asyncio
 import json
 import logging
 import math
 import random
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -403,6 +405,102 @@ def compute_simulated_trade(
 # ---------------------------------------------------------------------------
 
 
+def _run_single_trial(
+    market_dict: dict,
+    run_id: int,
+    horizon: int,
+    edge_threshold: float,
+    bankroll: float,
+    fee_rate: float,
+    effective_model: str,
+    estimator,
+    db_path: Path,
+    db_lock: threading.Lock,
+) -> dict:
+    """Execute one simulation trial. Designed to run in a thread pool.
+
+    Returns a result dict with trial metrics. DB insert is serialized via db_lock.
+    """
+    trial_start = time.time()
+
+    # Build market at horizon
+    built = build_market_at_horizon(market_dict, horizon)
+    if built is None:
+        logger.warning("Skipping %s: no price data at horizon", market_dict["id"][:16])
+        return {"skipped": True, "market_id": market_dict["id"]}
+
+    market_obj, truncated_history = built
+    market_price = market_obj.last_price_yes
+    market_obj._price_history_for_dossier = truncated_history
+    outcome = 1.0 if market_dict["resolution_outcome"] == "YES" else 0.0
+
+    # Run estimation (4 serial LLM passes)
+    agent_estimate = None
+    confidence_low = None
+    confidence_high = None
+    reasoning = None
+    trial_cost = 0.0
+    try:
+        estimate = estimator.estimate(market_obj, model=effective_model)
+        agent_estimate = estimate.final_estimate
+        confidence_low = estimate.confidence_low
+        confidence_high = estimate.confidence_high
+        reasoning = estimate.thesis
+        trial_cost = estimate.llm_cost if isinstance(getattr(estimate, "llm_cost", None), (int, float)) else 0.0
+    except Exception as e:
+        logger.error("Estimation failed for %s: %s", market_dict["id"][:16], e)
+
+    agent_brier = (agent_estimate - outcome) ** 2 if agent_estimate is not None else None
+    market_brier = (market_price - outcome) ** 2
+    edge = (agent_estimate - market_price) if agent_estimate is not None else None
+    trade = None
+    if agent_estimate is not None:
+        trade = compute_simulated_trade(
+            agent_estimate, market_price, outcome,
+            edge_threshold=edge_threshold, bankroll=bankroll, fee_rate=fee_rate,
+        )
+
+    trial_duration = int((time.time() - trial_start) * 1000)
+
+    # Compute training recency score
+    recency_score = None
+    if market_dict.get("end_date"):
+        from polymarket_agent.backtest.analysis import training_recency_score
+        try:
+            recency_score = training_recency_score(market_dict["end_date"], effective_model)
+        except Exception:
+            pass
+
+    # Persist trial (serialized to avoid SQLite write contention)
+    with db_lock:
+        with get_backtest_db(db_path) as conn:
+            conn.execute(
+                """INSERT INTO bt_simulation_trials
+                (run_id, market_id, horizon_days, market_price_at_horizon,
+                 agent_estimate, confidence_low, confidence_high, outcome,
+                 agent_brier, market_brier, edge, simulated_trade,
+                 reasoning, llm_cost, duration_ms, model, training_recency_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, market_dict["id"], horizon, market_price,
+                    agent_estimate, confidence_low, confidence_high, outcome,
+                    agent_brier, market_brier, edge,
+                    json.dumps(trade) if trade else None,
+                    reasoning, trial_cost, trial_duration,
+                    effective_model, recency_score,
+                ),
+            )
+
+    return {
+        "skipped": False,
+        "market_id": market_dict["id"],
+        "agent_brier": agent_brier,
+        "market_brier": market_brier,
+        "trade": trade,
+        "trial_cost": trial_cost,
+    }
+
+
 def run_simulation(
     markets: list[dict],
     horizon: int = DEFAULT_HORIZON,
@@ -413,8 +511,12 @@ def run_simulation(
     db_path: Path | None = None,
     model: str | None = None,
     hypothesis_id: int | None = None,
+    concurrency: int | None = None,
 ) -> dict:
     """Run a simulation across selected markets.
+
+    Trials are executed concurrently (up to `concurrency` at a time) using
+    asyncio + ThreadPoolExecutor. The public interface is synchronous.
 
     Returns run summary dict.
     """
@@ -449,130 +551,63 @@ def run_simulation(
         )
         run_id = cursor.lastrowid
 
-    # Set up estimator with historical gatherer
+    # Set up shared estimator (LLMClient is thread-safe after our changes)
     gatherer = HistoricalResearchGatherer(db_path=path)
     llm = LLMClient()
     estimator = ProbabilityEstimator(llm_client=llm, research_gatherer=gatherer)
 
-    # Run trials
+    max_concurrency = concurrency if concurrency is not None else settings.simulation_concurrency
+    db_lock = threading.Lock()
+    start_time = time.time()
+
+    # Run trials concurrently
+    trial_results = asyncio.run(
+        _run_trials_async(
+            markets=markets,
+            run_id=run_id,
+            horizon=horizon,
+            edge_threshold=edge_threshold,
+            bankroll=bankroll,
+            fee_rate=fee_rate,
+            effective_model=effective_model,
+            estimator=estimator,
+            db_path=path,
+            db_lock=db_lock,
+            max_concurrency=max_concurrency,
+            total=len(markets),
+        )
+    )
+
+    # Accumulate results
     total_agent_brier = 0.0
     total_market_brier = 0.0
     total_pnl = 0.0
     total_cost = 0.0
     valid_trials = 0
-    start_time = time.time()
+    processed = 0
 
-    prev_cumulative_cost = 0.0
-
-    for i, market_dict in enumerate(markets):
-        trial_start = time.time()
-
-        # Build market at horizon
-        result = build_market_at_horizon(market_dict, horizon)
-        if result is None:
-            logger.warning("Skipping %s: no price data at horizon", market_dict["id"][:16])
+    for r in trial_results:
+        if r.get("skipped"):
             continue
-
-        market_obj, truncated_history = result
-        market_price = market_obj.last_price_yes
-
-        # Attach price history for the gatherer
-        market_obj._price_history_for_dossier = truncated_history
-
-        # Parse outcome
-        outcome = 1.0 if market_dict["resolution_outcome"] == "YES" else 0.0
-
-        # Run estimation
-        agent_estimate = None
-        confidence_low = None
-        confidence_high = None
-        reasoning = None
-        try:
-            estimate = estimator.estimate(market_obj, model=model)
-            agent_estimate = estimate.final_estimate
-            confidence_low = estimate.confidence_low
-            confidence_high = estimate.confidence_high
-            reasoning = estimate.thesis
-        except Exception as e:
-            logger.error("Estimation failed for %s: %s", market_dict["id"][:16], e)
-
-        # Compute Brier scores
-        agent_brier = (agent_estimate - outcome) ** 2 if agent_estimate is not None else None
-        market_brier = (market_price - outcome) ** 2
-
-        # Compute edge and simulated trade
-        edge = (agent_estimate - market_price) if agent_estimate is not None else None
-        trade = None
-        if agent_estimate is not None:
-            trade = compute_simulated_trade(
-                agent_estimate, market_price, outcome,
-                edge_threshold=edge_threshold, bankroll=bankroll, fee_rate=fee_rate,
-            )
-
-        # LLM cost (delta from previous cumulative)
-        usage = llm.get_usage_summary()
-        cumulative_cost = usage.get("estimated_cost", 0.0)
-        trial_cost = cumulative_cost - prev_cumulative_cost
-        prev_cumulative_cost = cumulative_cost
-
-        trial_duration = int((time.time() - trial_start) * 1000)
-
-        # Compute training recency score
-        recency_score = None
-        if market_dict.get("end_date"):
-            from polymarket_agent.backtest.analysis import training_recency_score
-            try:
-                recency_score = training_recency_score(market_dict["end_date"], effective_model)
-            except Exception:
-                pass
-
-        # Persist trial
-        with get_backtest_db(path) as conn:
-            conn.execute(
-                """INSERT INTO bt_simulation_trials
-                (run_id, market_id, horizon_days, market_price_at_horizon,
-                 agent_estimate, confidence_low, confidence_high, outcome,
-                 agent_brier, market_brier, edge, simulated_trade,
-                 reasoning, llm_cost, duration_ms, model, training_recency_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    run_id, market_dict["id"], horizon, market_price,
-                    agent_estimate, confidence_low, confidence_high, outcome,
-                    agent_brier, market_brier, edge,
-                    json.dumps(trade) if trade else None,
-                    reasoning, trial_cost, trial_duration,
-                    effective_model, recency_score,
-                ),
-            )
-
-        # Accumulate
+        processed += 1
+        market_brier = r.get("market_brier", 0.0)
+        agent_brier = r.get("agent_brier")
+        total_market_brier += market_brier
         if agent_brier is not None:
             total_agent_brier += agent_brier
             valid_trials += 1
-        total_market_brier += market_brier
+        trade = r.get("trade")
         if trade:
             total_pnl += trade["net_pnl"]
-        total_cost += trial_cost
+        total_cost += r.get("trial_cost", 0.0)
 
-        # Progress logging
-        processed = i + 1
-        if processed % 5 == 0 or processed <= 3:
-            elapsed = time.time() - start_time
-            avg_agent = total_agent_brier / valid_trials if valid_trials > 0 else None
-            avg_market = total_market_brier / processed if processed > 0 else None
-            logger.info(
-                "Trial %d/%d | Agent Brier: %s | Market Brier: %.4f | "
-                "P&L: $%.2f | Elapsed: %.0fs",
-                processed, len(markets),
-                f"{avg_agent:.4f}" if avg_agent is not None else "N/A",
-                avg_market, total_pnl, elapsed,
-            )
+    # Use actual LLM cost from the shared client (more accurate than per-trial estimates)
+    actual_cost = llm.get_usage_summary().get("estimated_cost", total_cost)
 
     # Finalize run
     completed_at = datetime.now(timezone.utc).isoformat()
-    total_processed = valid_trials  # Only count trials with valid estimates
     avg_agent_brier = total_agent_brier / valid_trials if valid_trials > 0 else None
-    avg_market_brier = total_market_brier / len(markets) if markets else None
+    avg_market_brier = total_market_brier / processed if processed > 0 else None
 
     with get_backtest_db(path) as conn:
         conn.execute(
@@ -580,7 +615,7 @@ def run_simulation(
             SET completed_at = ?, agent_brier = ?, market_brier = ?,
                 simulated_pnl = ?, total_cost = ?
             WHERE id = ?""",
-            (completed_at, avg_agent_brier, avg_market_brier, total_pnl, total_cost, run_id),
+            (completed_at, avg_agent_brier, avg_market_brier, total_pnl, actual_cost, run_id),
         )
 
     # Auto-record hypothesis evidence if linked
@@ -594,7 +629,6 @@ def run_simulation(
             if brier_diff is not None and valid_trials >= 5:
                 supports = 1 if brier_diff < 0 else 0
 
-            # Compute paired stats for p-value
             p_value, effect_size = None, None
             if valid_trials >= 5:
                 p_value, effect_size = _compute_paired_stats(run_id, path)
@@ -625,9 +659,59 @@ def run_simulation(
         if avg_agent_brier is not None and avg_market_brier is not None
         else None,
         "simulated_pnl": total_pnl,
-        "total_cost": total_cost,
+        "total_cost": actual_cost,
         "elapsed_seconds": time.time() - start_time,
     }
+
+
+async def _run_trials_async(
+    markets: list[dict],
+    run_id: int,
+    horizon: int,
+    edge_threshold: float,
+    bankroll: float,
+    fee_rate: float,
+    effective_model: str,
+    estimator,
+    db_path: Path,
+    db_lock: threading.Lock,
+    max_concurrency: int,
+    total: int,
+) -> list[dict]:
+    """Run all trials concurrently bounded by a semaphore. Returns list of result dicts."""
+    sem = asyncio.Semaphore(max_concurrency)
+    completed = 0
+    results = []
+    results_lock = asyncio.Lock()
+
+    async def run_one(market_dict: dict) -> dict:
+        nonlocal completed
+        async with sem:
+            result = await asyncio.to_thread(
+                _run_single_trial,
+                market_dict,
+                run_id,
+                horizon,
+                edge_threshold,
+                bankroll,
+                fee_rate,
+                effective_model,
+                estimator,
+                db_path,
+                db_lock,
+            )
+        async with results_lock:
+            completed += 1
+            results.append(result)
+            if completed % 5 == 0 or completed <= 3 or completed == total:
+                logger.info(
+                    "Trial %d/%d completed (concurrency=%d)",
+                    completed, total, max_concurrency,
+                )
+        return result
+
+    await asyncio.gather(*[run_one(m) for m in markets])
+    return results
 
 
 def _compute_paired_stats(run_id: int, db_path: Path) -> tuple[float | None, float | None]:
@@ -828,6 +912,7 @@ def run_multi_model_evaluation(
     progressive: bool = True,
     progress_callback=None,
     db_path: Path | None = None,
+    concurrency: int | None = None,
 ) -> dict:
     """Run evaluation across multiple models on the same market set.
 
@@ -868,6 +953,7 @@ def run_multi_model_evaluation(
             fee_rate=fee_rate,
             db_path=db_path,
             model=model_id,
+            concurrency=concurrency,
         )
         runs[model_id] = result
         run_ids.append(result["run_id"])

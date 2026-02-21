@@ -572,6 +572,7 @@ def show_strategy():
 @click.option("--max-volume", type=float, default=None, help="Maximum volume")
 @click.option("--regime", "-r", help="Filter by regime (e.g. o1-era)")
 @click.option("--dry-run", is_flag=True, help="Preview market selection without running LLM")
+@click.option("--concurrency", type=int, default=None, help="Max parallel trials (default: simulation_concurrency setting)")
 def simulate_backtest(
     horizon: int,
     count: int,
@@ -580,6 +581,7 @@ def simulate_backtest(
     max_volume: float | None,
     regime: str | None,
     dry_run: bool,
+    concurrency: int | None,
 ):
     """Run LLM estimation against historical markets to measure accuracy."""
     from polymarket_agent.backtest.simulator import run_simulation, select_markets
@@ -636,7 +638,7 @@ def simulate_backtest(
         return
 
     console.print("Running estimation pipeline...\n")
-    result = run_simulation(markets, horizon=horizon)
+    result = run_simulation(markets, horizon=horizon, concurrency=concurrency)
 
     # Summary
     console.print(f"\n[bold green]Simulation Complete (Run #{result['run_id']})[/]")
@@ -797,6 +799,7 @@ def _resolve_model(name: str) -> str:
 @click.option("--budget", type=float, default=None, help="Maximum total LLM cost in USD")
 @click.option("--all-at-once", is_flag=True, help="Run all models without intermediate prompts")
 @click.option("--dry-run", is_flag=True, help="Preview market selection and cost estimate only")
+@click.option("--concurrency", type=int, default=None, help="Max parallel trials (default: simulation_concurrency setting)")
 def evaluate_backtest(
     models: tuple[str, ...],
     trials_per_cell: int,
@@ -805,6 +808,7 @@ def evaluate_backtest(
     budget: float | None,
     all_at_once: bool,
     dry_run: bool,
+    concurrency: int | None,
 ):
     """Run multi-model evaluation with stratified sampling and statistical comparison."""
     from polymarket_agent.backtest.simulator import (
@@ -924,6 +928,7 @@ def evaluate_backtest(
         budget=budget,
         progressive=not all_at_once,
         progress_callback=_progress_callback if not all_at_once else None,
+        concurrency=concurrency,
     )
 
     # Final report
