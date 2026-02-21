@@ -53,8 +53,9 @@ def classify_market_type(question: str, category: str | None) -> str:
         if category.startswith(SPORTS_CATEGORY_PREFIXES):
             return "sports"
 
-    # 2b. Sports — by " vs." pattern in question (catches null-category sports)
-    if " vs." in question:
+    # 2b. Sports — by "vs" pattern in question (catches null-category sports)
+    # Match both "Alice vs. Bob" (with period) and "Alice vs Bob" (no period)
+    if " vs." in question or " vs " in question:
         return "sports"
 
     # 3. Economic-range — category is a numeric bucket (e.g. "88,000-90,000")
