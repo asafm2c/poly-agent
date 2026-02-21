@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from polymarket_agent.backtest.classifier import classify_market_type
 from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
 from polymarket_agent.config import settings
 
@@ -250,12 +251,14 @@ class BacktestCollector:
                 pass
 
         now = datetime.now(timezone.utc).isoformat()
+        question_str = item.get("question", "")
+        market_type = classify_market_type(question_str, category)
 
         conn.execute(
             """INSERT INTO bt_markets (id, question, description, category, end_date,
                 volume, liquidity, resolution_outcome, yes_token, no_token,
-                has_history, collected_at, event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                has_history, collected_at, event_id, market_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 question = excluded.question,
                 description = excluded.description,
@@ -266,10 +269,11 @@ class BacktestCollector:
                 resolution_outcome = excluded.resolution_outcome,
                 yes_token = excluded.yes_token,
                 no_token = excluded.no_token,
-                event_id = excluded.event_id""",
+                event_id = excluded.event_id,
+                market_type = COALESCE(bt_markets.market_type, excluded.market_type)""",
             (
                 market_id,
-                item.get("question", ""),
+                question_str,
                 item.get("description"),
                 category,
                 item.get("endDate") or item.get("end_date_iso"),
@@ -280,6 +284,7 @@ class BacktestCollector:
                 no_token,
                 now,
                 event_id,
+                market_type,
             ),
         )
         return True

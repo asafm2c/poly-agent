@@ -186,11 +186,15 @@ def select_markets(
     regime: str | None = None,
     horizon: int = DEFAULT_HORIZON,
     db_path: Path | None = None,
+    market_types: list[str] | None = None,
 ) -> list[dict]:
     """Select historical markets for simulation.
 
     Returns list of market dicts with metadata and price_history.
     Only markets with has_history=1 and a YES/NO outcome are eligible.
+
+    Args:
+        market_types: If not None, restrict to markets whose market_type is in this list.
     """
     conditions = [
         "m.has_history = 1",
@@ -229,6 +233,11 @@ def select_markets(
             )"""
         )
         params.append(regime)
+
+    if market_types is not None:
+        placeholders = ",".join("?" * len(market_types))
+        conditions.append(f"m.market_type IN ({placeholders})")
+        params.extend(market_types)
 
     where = " AND ".join(conditions)
     path = db_path or settings.backtest_db_path
@@ -787,8 +796,13 @@ def select_markets_stratified(
     volume_tiers: dict[str, tuple[float, float | None]] | None = None,
     horizon: int = DEFAULT_HORIZON,
     db_path: Path | None = None,
+    market_types: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Select markets with stratified sampling across category x volume tier.
+
+    Args:
+        market_types: If not None, restrict each cell's candidates to markets with
+            market_type in this list.
 
     Returns:
         (markets, cell_counts) where cell_counts is
@@ -841,6 +855,11 @@ def select_markets_stratified(
                 else:
                     conditions.append("m.category = ?")
                     params.append(cat)
+
+                if market_types is not None:
+                    placeholders = ",".join("?" * len(market_types))
+                    conditions.append(f"m.market_type IN ({placeholders})")
+                    params.extend(market_types)
 
                 where = " AND ".join(conditions)
 

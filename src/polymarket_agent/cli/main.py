@@ -524,6 +524,72 @@ def list_jobs():
     console.print(table)
 
 
+@backtest.command("backfill")
+@click.option("--stats", is_flag=True, help="Show current distribution without re-classifying")
+def backtest_backfill(stats: bool):
+    """Classify all bt_markets rows and write market_type. Use --stats to view without modifying."""
+    from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+    from polymarket_agent.config import settings
+    from rich.table import Table as RichTable
+
+    init_backtest_db()
+
+    if stats:
+        with get_backtest_db(settings.backtest_db_path) as conn:
+            rows = conn.execute(
+                """SELECT COALESCE(market_type, '(null)') as mtype, COUNT(*) as cnt
+                FROM bt_markets
+                GROUP BY mtype
+                ORDER BY cnt DESC"""
+            ).fetchall()
+
+        table = RichTable(title="Market Type Distribution (current)")
+        table.add_column("market_type")
+        table.add_column("count", justify="right")
+        for r in rows:
+            table.add_row(r["mtype"], f"{r['cnt']:,}")
+        console.print(table)
+        return
+
+    # Full backfill
+    from polymarket_agent.backtest.classifier import classify_market_type
+
+    with get_backtest_db(settings.backtest_db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, question, category FROM bt_markets"
+        ).fetchall()
+
+        total = len(rows)
+        console.print(f"Classifying {total:,} markets...")
+
+        batch_size = 1000
+        for i in range(0, total, batch_size):
+            batch = rows[i : i + batch_size]
+            updates = [
+                (classify_market_type(r["question"], r["category"]), r["id"])
+                for r in batch
+            ]
+            conn.executemany(
+                "UPDATE bt_markets SET market_type = ? WHERE id = ?", updates
+            )
+            if i % 10000 == 0 and i > 0:
+                console.print(f"  {i:,}/{total:,}...")
+
+        summary_rows = conn.execute(
+            """SELECT COALESCE(market_type, '(null)') as mtype, COUNT(*) as cnt
+            FROM bt_markets
+            GROUP BY mtype
+            ORDER BY cnt DESC"""
+        ).fetchall()
+
+    table = RichTable(title=f"Backfill Complete — {total:,} markets classified")
+    table.add_column("market_type")
+    table.add_column("count", justify="right")
+    for r in summary_rows:
+        table.add_row(r["mtype"], f"{r['cnt']:,}")
+    console.print(table)
+
+
 @backtest.command("analyze")
 @click.option("--category", "-c", help="Filter by category")
 @click.option("--regime", "-r", help="Filter by regime (e.g. o1-era, GPT4o-era)")
@@ -663,6 +729,8 @@ def show_strategy():
 @click.option("--regime", "-r", help="Filter by regime (e.g. o1-era)")
 @click.option("--dry-run", is_flag=True, help="Preview market selection without running LLM")
 @click.option("--concurrency", type=int, default=None, help="Max parallel trials (default: simulation_concurrency setting)")
+@click.option("--market-type", "market_types", multiple=True,
+              help="Restrict to market type (repeatable). Default: prediction.")
 def simulate_backtest(
     horizon: int,
     count: int,
@@ -672,14 +740,18 @@ def simulate_backtest(
     regime: str | None,
     dry_run: bool,
     concurrency: int | None,
+    market_types: tuple[str, ...],
 ):
     """Run LLM estimation against historical markets to measure accuracy."""
     from polymarket_agent.backtest.simulator import run_simulation, select_markets
+
+    resolved_types = list(market_types) if market_types else ["prediction"]
 
     console.print(f"\n[bold]Simulation Setup[/]")
     console.print(f"  Horizon: {horizon} days before resolution")
     console.print(f"  Target count: {count} markets")
     console.print(f"  Category: {category or '(null — prediction markets)'}")
+    console.print(f"  Market types: {', '.join(resolved_types)}")
     console.print(f"  Volume: >= ${min_volume:,.0f}")
     if max_volume:
         console.print(f"  Max volume: <= ${max_volume:,.0f}")
@@ -697,6 +769,7 @@ def simulate_backtest(
             volume_max=max_volume,
             regime=regime,
             horizon=horizon,
+            market_types=resolved_types,
         )
 
     if not markets:
@@ -890,6 +963,8 @@ def _resolve_model(name: str) -> str:
 @click.option("--all-at-once", is_flag=True, help="Run all models without intermediate prompts")
 @click.option("--dry-run", is_flag=True, help="Preview market selection and cost estimate only")
 @click.option("--concurrency", type=int, default=None, help="Max parallel trials (default: simulation_concurrency setting)")
+@click.option("--market-type", "market_types", multiple=True,
+              help="Restrict to market type (repeatable). Default: prediction.")
 def evaluate_backtest(
     models: tuple[str, ...],
     trials_per_cell: int,
@@ -899,6 +974,7 @@ def evaluate_backtest(
     all_at_once: bool,
     dry_run: bool,
     concurrency: int | None,
+    market_types: tuple[str, ...],
 ):
     """Run multi-model evaluation with stratified sampling and statistical comparison."""
     from polymarket_agent.backtest.simulator import (
@@ -917,12 +993,15 @@ def evaluate_backtest(
     if categories:
         cat_list = [None if c.lower() == "null" else c for c in categories]
 
+    resolved_types = list(market_types) if market_types else ["prediction"]
+
     # Select markets
     with console.status("Selecting markets (stratified)..."):
         markets, cell_counts = select_markets_stratified(
             n_per_cell=trials_per_cell,
             categories=cat_list,
             horizon=horizon,
+            market_types=resolved_types,
         )
 
     if not markets:

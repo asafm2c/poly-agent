@@ -2487,3 +2487,38 @@ class TestRunSimulationModelParam:
         assert row is not None
         config = json.loads(row["config"])
         assert config["model"] == target_model
+
+
+# ---------------------------------------------------------------------------
+# Classifier tests (7 scenarios from spec)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMarketType:
+    def test_tick_market(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("Bitcoin Up or Down - 3:15PM ET", None) == "tick"
+
+    def test_sports_by_category(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("Chelsea vs Arsenal", "Match Winner") == "sports"
+
+    def test_sports_by_vs_pattern_null_category(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("Birrell vs. Bhamidipaty", None) == "sports"
+
+    def test_spread_category_is_sports(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("Cowboys -3.5", "Spread -3.5") == "sports"
+
+    def test_economic_range_by_category(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("NFP report", "88,000-90,000") == "economic-range"
+
+    def test_prediction_market(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("Will Trump sign the tariff bill by March?", None) == "prediction"
+
+    def test_tick_beats_sports_priority(self):
+        from polymarket_agent.backtest.classifier import classify_market_type
+        assert classify_market_type("BTC Up or Down vs ETH", "Match Winner") == "tick"
