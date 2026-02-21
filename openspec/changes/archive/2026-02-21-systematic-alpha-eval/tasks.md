@@ -95,7 +95,7 @@
 
 ## 7. Tests
 
-- [ ] 7.1 Unit test `select_markets_stratified()`
+- [x] 7.1 Unit test `select_markets_stratified()`
   - Files: `tests/test_backtest.py`
 
 - [x] 7.2 Unit test `training_recency_score()` — TestTrainingRecencyScore (5 tests)
@@ -110,11 +110,11 @@
 - [x] 7.5 Unit test `cross_model_comparison()` — TestCrossModelComparison (5 tests)
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.6 Integration test `run_multi_model_evaluation()` with mocked LLM
+- [x] 7.6 Integration test `run_multi_model_evaluation()` with mocked LLM
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.7 CLI smoke test for `backtest evaluate --dry-run`
+- [x] 7.7 CLI smoke test for `backtest evaluate --dry-run`
   - Files: `tests/test_backtest.py`
 
-- [ ] 7.8 Test `run_simulation()` with `model` parameter
+- [x] 7.8 Test `run_simulation()` with `model` parameter
   - Files: `tests/test_backtest.py`

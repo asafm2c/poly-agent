@@ -1,49 +1,73 @@
 ## Purpose
 
-Extend the analysis library with functions to query hypothesis evidence alongside simulation results, and to compute hypothesis-specific metrics from trial data. These additions enable hypothesis-aware aggregation -- filtering and grouping simulation results by the hypothesis they were run to test.
+Delta spec for the existing analysis-library capability. Adds cross-model comparison functions, training-recency-weighted aggregation, bootstrap confidence intervals, and per-cell breakdowns. All new functions are additive -- existing functions (`simulation_summary()`, `simulation_by_category()`, `simulation_by_volume_tier()`, `load_markets()`, etc.) remain unchanged.
+
+## ADDED Requirements
+
+### Requirement: Training recency score computation
+The analysis library MUST provide a `training_recency_score(resolution_date, model)` function as specified in the temporal-confidence-weighting spec. This function MUST be defined in `analysis.py` alongside the `MODEL_TRAINING_CUTOFFS` constant.
+
+#### Scenario: Function importable from analysis module
+- **WHEN** `from polymarket_agent.backtest.analysis import training_recency_score` is executed
+- **THEN** the import succeeds and the function is callable
+
+### Requirement: Weighted Brier aggregation
+The analysis library MUST provide a `weighted_brier(trials, weight_key)` function as specified in the temporal-confidence-weighting spec. It MUST handle NULL weights, zero total weight, and mixed-weight scenarios.
+
+#### Scenario: Weighted Brier with full-weight trials
+- **GIVEN** 20 trials all with `training_recency_score = 1.0`
+- **WHEN** `weighted_brier(trials)` is called
+- **THEN** `agent_brier_weighted` equals the unweighted mean agent Brier score
+
+### Requirement: Bootstrap confidence interval
+The analysis library MUST provide a `brier_confidence_interval(agent_briers, market_briers, ...)` function as specified in the statistical-comparison spec. It MUST use only Python standard library for bootstrap resampling.
+
+#### Scenario: CI computed for typical run
+- **GIVEN** 50 paired Brier scores
+- **WHEN** `brier_confidence_interval(agent_briers, market_briers, seed=42)` is called
+- **THEN** the function returns `mean_diff`, `ci_low`, `ci_high`, `p_value`, `n=50`, and `significant` (bool)
+
+### Requirement: Cross-model comparison
+The analysis library MUST provide a `cross_model_comparison(run_ids, db_path)` function as specified in the statistical-comparison spec. It MUST load trials from the database, match by `market_id`, and produce per-model summaries, pairwise CIs, and per-cell breakdowns.
+
+#### Scenario: Two-model comparison
+- **GIVEN** run IDs 4 (Haiku) and 5 (Sonnet) with 80 paired trials
+- **WHEN** `cross_model_comparison(run_ids=[4, 5])` is called
+- **THEN** `"models"` has 2 entries, `"pairwise"` has 1 entry (Haiku vs Sonnet), and `"by_cell"` has entries for each (category, tier) with at least one trial
+
+### Requirement: Per-cell breakdown with sufficiency flag
+The `"by_cell"` output of `cross_model_comparison()` MUST include `"n"` (trial count) and `"sufficient"` (bool, True if n >= 20) for each cell. Cells with `"sufficient": False` MUST be clearly distinguishable in the output.
+
+#### Scenario: Mixed sufficiency across cells
+- **GIVEN** cell (null, "1M-10M") has 25 trials and cell (crypto, ">10M") has 8 trials
+- **WHEN** `cross_model_comparison()` returns
+- **THEN** `by_cell[(None, "1M-10M")]["sufficient"]` is `True` and `by_cell[("crypto", ">10M")]["sufficient"]` is `False`
+
+### Requirement: Recency-weighted aggregation in cross-model comparison
+`cross_model_comparison()` MUST compute both unweighted and recency-weighted Brier scores for each model by calling `weighted_brier()` on each model's trials. Both values MUST appear in the per-model summary.
+
+#### Scenario: Weighted and unweighted differ
+- **GIVEN** a model's trials include some with low recency scores (near training cutoff)
+- **WHEN** `cross_model_comparison()` computes the model summary
+- **THEN** `agent_brier_weighted` differs from `agent_brier` because low-recency trials are down-weighted
 
 ## MODIFIED Requirements
 
-### Requirement: Hypothesis evidence aggregation
-The analysis library SHALL provide a `hypothesis_evidence_summary()` function that loads all evidence records for a given hypothesis ID and returns aggregate metrics: total trial count, weighted Brier diff, weighted confidence, number of supporting vs contradicting evidence records, and the most recent evidence date.
+(None. Existing functions are unchanged. All changes are additive.)
 
-#### Scenario: Summary for hypothesis with multiple evidence records
-- **GIVEN** a hypothesis with ID 1 that has 3 evidence records from different simulation runs
-- **WHEN** `hypothesis_evidence_summary(hypothesis_id=1)` is called
-- **THEN** the function returns a dict with `total_trial_count`, `weighted_brier_diff`, `weighted_confidence`, `supporting_count`, `contradicting_count`, `inconclusive_count`, `latest_evidence_date`, and `evidence_count`
+## Backward Compatibility
 
-#### Scenario: Summary for hypothesis with no evidence
-- **GIVEN** a hypothesis with ID 5 that has zero evidence records (status='proposed')
-- **WHEN** `hypothesis_evidence_summary(hypothesis_id=5)` is called
-- **THEN** the function returns a dict with all counts at 0, `weighted_brier_diff=0.0`, `weighted_confidence=0.0`, and `latest_evidence_date=None`
+### Requirement: Existing functions unmodified
+`simulation_summary()`, `simulation_by_category()`, `simulation_by_volume_tier()`, `load_markets()`, `efficiency_index()`, `category_calibration()`, `price_momentum()`, `cross_market_arbitrage()`, `market_baseline_brier()`, and `regime_comparison()` MUST continue to work with their existing signatures and return the same structures. No existing function is modified.
 
-### Requirement: Hypothesis-filtered simulation metrics
-The analysis library SHALL provide a `simulation_by_hypothesis()` function that groups trial results from all simulation runs linked to a specific hypothesis, returning aggregate metrics across those runs.
+#### Scenario: Existing simulation_summary still works
+- **GIVEN** a completed simulation run from before this change
+- **WHEN** `simulation_summary(run_id=3)` is called
+- **THEN** the function returns the same result as before, with no errors from NULL `model` or `training_recency_score` columns
 
-#### Scenario: Metrics across hypothesis-linked runs
-- **GIVEN** a hypothesis with ID 2 linked to 3 simulation runs totaling 80 trials
-- **WHEN** `simulation_by_hypothesis(hypothesis_id=2)` is called
-- **THEN** the function returns a dict with `agent_brier`, `market_brier`, `brier_diff`, `trial_count`, `simulated_pnl`, `trade_count`, and `win_rate` aggregated across all 80 trials from those 3 runs
+### Requirement: Analysis functions callable from any context
+All new analysis functions (`training_recency_score`, `weighted_brier`, `brier_confidence_interval`, `cross_model_comparison`) MUST work when called from Python scripts, CLI commands, or Jupyter notebooks. They MUST accept standard Python arguments and return structured dictionaries, not print to stdout.
 
-#### Scenario: No linked simulation runs
-- **GIVEN** a hypothesis with ID 3 that has no linked simulation runs
-- **WHEN** `simulation_by_hypothesis(hypothesis_id=3)` is called
-- **THEN** the function returns a dict with `trial_count=0` and all metrics as None
-
-### Requirement: Paired statistical comparison
-The analysis library SHALL provide a `compute_paired_stats()` function that computes a paired t-test p-value and Cohen's d effect size from per-trial Brier scores for a given simulation run. This function SHALL use a normal approximation for the p-value (no scipy dependency) and SHALL require a minimum of 5 trials.
-
-#### Scenario: Sufficient trials for paired test
-- **GIVEN** a simulation run with 40 trials that all have `agent_brier` and `market_brier` values
-- **WHEN** `compute_paired_stats(run_id=1)` is called
-- **THEN** the function returns a tuple of `(p_value, effect_size)` where `p_value` is a float in [0, 1] and `effect_size` (Cohen's d) is a float
-
-#### Scenario: Insufficient trials
-- **GIVEN** a simulation run with only 3 valid trials
-- **WHEN** `compute_paired_stats(run_id=1)` is called
-- **THEN** the function returns `(None, None)`
-
-#### Scenario: All trials agree (zero variance edge case)
-- **GIVEN** a simulation run where all per-trial Brier diffs are identical
-- **WHEN** `compute_paired_stats()` is called
-- **THEN** the function handles the zero-variance case gracefully (uses a small epsilon for standard deviation) and returns a valid p_value and effect_size
+#### Scenario: New functions used in notebook
+- **WHEN** `from polymarket_agent.backtest.analysis import brier_confidence_interval, cross_model_comparison` is executed in a Jupyter notebook
+- **THEN** both functions are importable and return dict results suitable for further analysis

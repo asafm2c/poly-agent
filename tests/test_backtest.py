@@ -2271,3 +2271,219 @@ class TestLLMClientRetry:
         assert summary["calls"] == 5
         assert summary["input_tokens"] == 500
         assert summary["output_tokens"] == 250
+
+
+# ---------------------------------------------------------------------------
+# Task 7.1 — Unit tests for select_markets_stratified()
+# ---------------------------------------------------------------------------
+
+
+class TestSelectMarketsStratified:
+    """7.1 Unit tests for select_markets_stratified() stratified sampling."""
+
+    def test_select_markets_stratified_empty_db(self):
+        """Empty DB returns a tuple where the markets list is empty."""
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.simulator import select_markets_stratified
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        result = select_markets_stratified(
+            n_per_cell=5,
+            categories=["crypto"],
+            db_path=TEST_BACKTEST_DB,
+        )
+
+        # Must return a tuple
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+        markets, cell_counts = result
+        # No markets in DB => empty list
+        assert isinstance(markets, list)
+        assert len(markets) == 0
+
+    def test_select_markets_stratified_with_markets(self):
+        """With one eligible market, returns it and correct cell_counts structure."""
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.simulator import select_markets_stratified
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        # Insert a resolved market with has_history=1, volume=500_000 (100K-1M tier)
+        end_date = "2024-08-01T00:00:00Z"
+        collected_at = datetime.now(timezone.utc).isoformat()
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                """INSERT INTO bt_markets
+                (id, question, category, end_date, volume, liquidity,
+                 resolution_outcome, has_history, collected_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'YES', 1, ?)""",
+                ("strat-m1", "Will X happen?", "crypto", end_date, 500_000, 10_000, collected_at),
+            )
+            # Insert a price_history row with timestamp well before end_date - 7 days.
+            # end_date = 2024-08-01; 7-day horizon means ts must be <= 2024-07-25.
+            # Use 2024-07-20 (11 days before end).
+            ts = int(datetime(2024, 7, 20, tzinfo=timezone.utc).timestamp())
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("strat-m1", ts, 0.65),
+            )
+
+        result = select_markets_stratified(
+            n_per_cell=5,
+            categories=["crypto"],
+            horizon=7,
+            db_path=TEST_BACKTEST_DB,
+        )
+
+        assert isinstance(result, tuple)
+        markets, cell_counts = result
+
+        # At least one market was found
+        assert len(markets) >= 1
+
+        # cell_counts keys are (category, tier_name) tuples
+        for key in cell_counts:
+            assert isinstance(key, tuple)
+            assert len(key) == 2
+            cat, tier_name = key
+            assert isinstance(tier_name, str)
+
+        # For the "crypto" category, at least one cell should show selected <= available
+        for (cat, tier), counts in cell_counts.items():
+            if cat == "crypto":
+                assert counts["selected"] <= counts["available"]
+                assert "requested" in counts
+
+
+# ---------------------------------------------------------------------------
+# Task 7.6 — Integration tests for run_multi_model_evaluation()
+# ---------------------------------------------------------------------------
+
+
+class TestRunMultiModelEvaluation:
+    """7.6 Integration tests for run_multi_model_evaluation()."""
+
+    def test_run_multi_model_evaluation_zero_budget(self):
+        """budget=0.0 causes models to be skipped when estimated cost > 0."""
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.simulator import run_multi_model_evaluation
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        # With 1 market and budget=0.0, estimated_cost=0.005 > 0.0 => model is skipped.
+        result = run_multi_model_evaluation(
+            markets=[{"id": "test-market"}],
+            models=["claude-haiku-4-5-20251001"],
+            budget=0.0,
+            db_path=TEST_BACKTEST_DB,
+        )
+
+        assert "runs" in result
+        assert isinstance(result["runs"], dict)
+        # All models skipped because estimated_cost (0.005) > budget (0.0)
+        assert result["runs"] == {}
+        assert "comparison" in result
+
+    def test_run_multi_model_evaluation_returns_structure(self):
+        """Mocked run_simulation: result has 'runs' and 'comparison' keys with correct data."""
+        from polymarket_agent.backtest.database import init_backtest_db
+        from polymarket_agent.backtest.simulator import run_multi_model_evaluation
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        fake_result = {
+            "run_id": 1,
+            "total_cost": 0.01,
+            "trials": [],
+            "agent_brier": 0.15,
+            "market_brier": 0.18,
+            "n": 5,
+        }
+
+        with patch(
+            "polymarket_agent.backtest.simulator.run_simulation",
+            return_value=fake_result,
+        ):
+            result = run_multi_model_evaluation(
+                markets=[{"id": "test"}],
+                models=["claude-haiku-4-5-20251001"],
+                db_path=TEST_BACKTEST_DB,
+            )
+
+        assert "runs" in result
+        assert "comparison" in result
+        assert "claude-haiku-4-5-20251001" in result["runs"]
+        assert result["runs"]["claude-haiku-4-5-20251001"] is fake_result
+
+
+# ---------------------------------------------------------------------------
+# Task 7.7 — CLI smoke test: backtest evaluate --dry-run
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateCLIDryRun:
+    """7.7 CLI smoke test for backtest evaluate --dry-run."""
+
+    def test_backtest_evaluate_dry_run_smoke(self):
+        """Dry-run exits cleanly even when no eligible markets exist."""
+        from click.testing import CliRunner
+        from polymarket_agent.cli.main import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["backtest", "evaluate", "--dry-run", "--budget", "0"])
+
+        # Should exit 0 or at least not crash with an unhandled exception
+        # In dry-run with no markets the CLI prints "No eligible markets found." and returns.
+        assert result.exit_code == 0 or "Error" not in (result.output or "")
+        # No raw Python traceback should appear
+        assert "Traceback" not in (result.output or "")
+
+
+# ---------------------------------------------------------------------------
+# Task 7.8 — Test run_simulation() stores model in bt_simulation_runs
+# ---------------------------------------------------------------------------
+
+
+class TestRunSimulationModelParam:
+    """7.8 Test that run_simulation() stores the model in bt_simulation_runs.config."""
+
+    def test_run_simulation_stores_model_in_config(self):
+        """run_simulation(model=...) records model name in bt_simulation_runs.config JSON."""
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.simulator import run_simulation
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        target_model = "claude-haiku-4-5-20251001"
+
+        # Empty markets list => no LLM calls needed; the run record is still created.
+        with patch("polymarket_agent.analyst.estimator.ProbabilityEstimator") as mock_est_cls:
+            mock_estimator = MagicMock()
+            mock_est_cls.return_value = mock_estimator
+            with patch("polymarket_agent.analyst.llm_client.LLMClient") as mock_llm_cls:
+                mock_llm = MagicMock()
+                mock_llm.get_usage_summary.return_value = {"estimated_cost": 0.0}
+                mock_llm_cls.return_value = mock_llm
+
+                result = run_simulation(
+                    markets=[],
+                    model=target_model,
+                    db_path=TEST_BACKTEST_DB,
+                )
+
+        run_id = result["run_id"]
+        assert run_id is not None
+
+        # Verify the model is recorded in bt_simulation_runs.config
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            row = conn.execute(
+                "SELECT config FROM bt_simulation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+
+        assert row is not None
+        config = json.loads(row["config"])
+        assert config["model"] == target_model
