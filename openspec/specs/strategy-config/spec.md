@@ -1,68 +1,78 @@
-## ADDED Requirements
+## Purpose
 
-### Requirement: Strategy configuration file defines trading directives
-The system SHALL use a `strategy.yaml` file to capture research-derived trading directives. The file SHALL include sections for market selection rules, per-category edge thresholds, regime awareness, and accumulated insights.
+Extend the strategy configuration loader to merge active hypothesis-driven actions into the returned config dict. When the strategy is loaded at startup or refresh, confirmed hypothesis actions are queried and their parameter adjustments (category targeting, category avoidance, edge overrides, weight adjustments) are merged into the appropriate config sections. User-explicit values in `strategy.yaml` always take precedence over hypothesis-driven values.
 
-#### Scenario: Default strategy config created
-- **WHEN** no `strategy.yaml` exists and the system starts
-- **THEN** a default strategy config is created with conservative defaults: no category targeting (all categories), default edge thresholds, regime set to "unvalidated", and empty insights list
+## MODIFIED Requirements
 
-#### Scenario: Strategy config structure
-- **WHEN** `strategy.yaml` is loaded
-- **THEN** it contains sections: `version` (integer), `updated_at` (ISO date), `updated_by` (string describing source), `market_selection` (target/avoid categories, volume range, days-to-resolution range), `edge_thresholds` (per-category overrides, default, floor, ceiling), `regime_awareness` (current regime, efficiency trend, agent confidence), and `insights` (list of dated findings with confidence and implication)
+### Requirement: Hypothesis actions merged into strategy config
+The `load_strategy_config()` function SHALL, after loading `strategy.yaml`, call `load_active_hypothesis_actions()` and merge the resulting actions into the config dict via a `_merge_hypothesis_actions()` helper. If hypothesis loading fails (e.g., database not initialized), the function SHALL log a warning and return the config without hypothesis actions.
 
-### Requirement: Strategy config is human-reviewable and version-controllable
-The strategy config SHALL be a plain YAML file that can be reviewed in git diffs, edited by hand, or updated programmatically. Updates SHALL increment the version number and record the source of the update.
+#### Scenario: Strategy config includes hypothesis actions on load
+- **GIVEN** a confirmed hypothesis "sports-no-alpha" with an active `category_avoid` action for "Match Winner"
+- **WHEN** `load_strategy_config()` is called
+- **THEN** the returned config dict has "Match Winner" in `market_selection.avoid_categories`
 
-#### Scenario: Research session updates strategy
-- **WHEN** an LLM agent or human produces a strategy update from backtest analysis
-- **THEN** the update is written to `strategy.yaml` with incremented version, current date in `updated_at`, description of source in `updated_by`, and the specific fields changed
+#### Scenario: Hypothesis loading failure is non-fatal
+- **GIVEN** the backtest database does not exist or is not initialized
+- **WHEN** `load_strategy_config()` attempts to load hypothesis actions
+- **THEN** a warning is logged, and the config is returned with only the values from `strategy.yaml`
 
-#### Scenario: Strategy diff is reviewable
-- **WHEN** a strategy update is proposed
-- **THEN** the human can review the diff (via `git diff strategy.yaml`) before committing the change
+### Requirement: Category target actions add to target list
+When a `category_target` action is active, its `config.category` SHALL be appended to `market_selection.target_categories` in the strategy config, if not already present.
 
-### Requirement: Analysis library can propose strategy updates
-The analysis library SHALL provide an `update_strategy_config()` function that modifies specific fields in `strategy.yaml` based on analysis findings. The function SHALL add an insight entry documenting what was changed and why.
+#### Scenario: Category target appended
+- **GIVEN** a confirmed hypothesis with a `category_target` action for category `null` (prediction markets)
+- **WHEN** strategy config is merged
+- **THEN** `market_selection.target_categories` includes the targeted category value
 
-#### Scenario: Category threshold updated from backtest
-- **WHEN** backtest analysis shows crypto markets have 8% systematic bias and `update_strategy_config(category_overrides={"crypto": 0.12}, insight="Crypto 8% bullish bias across regimes")` is called
-- **THEN** `strategy.yaml` is updated with the new crypto edge threshold, an insight entry is appended, version is incremented, and `updated_by` records the source
+#### Scenario: Duplicate category target not re-added
+- **GIVEN** `strategy.yaml` already includes "crypto" in `target_categories`, and a hypothesis action also targets "crypto"
+- **WHEN** strategy config is merged
+- **THEN** "crypto" appears only once in `target_categories`
 
-#### Scenario: Market selection updated from efficiency analysis
-- **WHEN** efficiency analysis shows politics markets are highly efficient and `update_strategy_config(avoid_categories=["politics"])` is called
-- **THEN** `strategy.yaml` adds "politics" to the avoid list and records the insight
+### Requirement: Category avoid actions add to avoid list
+When a `category_avoid` action is active, its `config.category` SHALL be appended to `market_selection.avoid_categories` in the strategy config, if not already present.
 
-### Requirement: Tactical layer reads strategy config at startup
-The scheduler SHALL load `strategy.yaml` at startup and apply its directives to market selection, edge threshold computation, and logging. If the file does not exist, the scheduler SHALL use default behavior (no category filtering, existing threshold logic).
+#### Scenario: Category avoid appended
+- **GIVEN** a confirmed hypothesis with a `category_avoid` action for "Match Winner"
+- **WHEN** strategy config is merged
+- **THEN** `market_selection.avoid_categories` includes "Match Winner"
 
-#### Scenario: Category filtering applied
-- **WHEN** `strategy.yaml` specifies `target_categories: ["crypto", "science"]` and `avoid_categories: ["politics"]`
-- **THEN** the scanner filters candidates to include only targeted categories and exclude avoided categories
+### Requirement: Edge override actions add to category overrides
+When an `edge_override` action is active with `effective_strength > 0.1`, the effective threshold SHALL be inserted into `edge_thresholds.category_overrides` keyed by `config.applies_to`, only if that key is not already present (user values win).
 
-#### Scenario: Edge threshold overrides applied
-- **WHEN** `strategy.yaml` specifies `edge_thresholds.category_overrides.crypto: 0.12`
-- **THEN** `compute_required_edge()` uses 0.12 as the base threshold for crypto markets instead of the default
+#### Scenario: Edge override inserted for new category
+- **GIVEN** a confirmed hypothesis with `edge_override` (`base_threshold=0.08`, `applies_to="100K-1M"`, `effective_strength=0.75`) and no existing "100K-1M" key in `category_overrides`
+- **WHEN** strategy config is merged
+- **THEN** `edge_thresholds.category_overrides["100K-1M"]` is set to `0.08 * (1.0 + (1.0 - 0.75) * 0.5) = 0.09`, rounded to 4 decimal places
 
-#### Scenario: Missing strategy config uses defaults
-- **WHEN** `strategy.yaml` does not exist
-- **THEN** the scheduler operates with existing default behavior — no category filtering, standard threshold logic
+#### Scenario: Edge override skipped when user value exists
+- **GIVEN** `strategy.yaml` explicitly sets `edge_thresholds.category_overrides["100K-1M"]: 0.12` AND a hypothesis edge_override action also targets "100K-1M"
+- **WHEN** strategy config is merged
+- **THEN** the value remains 0.12 (user value preserved)
 
-#### Scenario: Strategy config logged at startup
-- **WHEN** the scheduler starts and loads a strategy config
-- **THEN** the active strategy is logged: targeted categories, avoided categories, override thresholds, current regime assessment, and config version
+#### Scenario: Edge override skipped when strength too low
+- **GIVEN** a hypothesis `edge_override` action with `effective_strength=0.05` (below the 0.1 minimum)
+- **WHEN** strategy config is merged
+- **THEN** the override is not applied (strength too low to justify influence)
 
-### Requirement: Strategy drift monitoring in daily report
-The daily report SHALL compare actual predict-mode performance against strategy expectations and flag significant divergence.
+### Requirement: All actions stored in hypothesis_actions key
+All active actions (regardless of type) SHALL be appended to a `hypothesis_actions` key in the strategy config dict, making them available to downstream consumers like `build_recommendation()` for weight adjustments and logging.
 
-#### Scenario: Performance matches expectations
-- **WHEN** the daily report runs and the agent's rolling Brier score per category is within 0.05 of the strategy's expected efficiency level
-- **THEN** the report notes "Strategy aligned" for that category
+#### Scenario: Hypothesis actions key populated
+- **GIVEN** 3 active actions from 2 confirmed hypotheses
+- **WHEN** strategy config is merged
+- **THEN** `config["hypothesis_actions"]` contains all 3 action dicts with their `effective_strength` values
 
-#### Scenario: Performance diverges from expectations
-- **WHEN** the agent's Brier score in a category is more than 0.05 worse than expected based on strategy config
-- **THEN** the daily report flags "Strategy drift: {category} underperforming. Brier {actual} vs expected {expected}. Research review recommended."
+#### Scenario: No active actions
+- **GIVEN** no confirmed hypotheses exist
+- **WHEN** strategy config is merged
+- **THEN** `config["hypothesis_actions"]` is an empty list
 
-#### Scenario: Insufficient data for monitoring
-- **WHEN** fewer than 10 predictions have resolved in a category
-- **THEN** the report notes "Insufficient data for strategy monitoring in {category}"
+### Requirement: Strategy config merge is additive only
+The merge function SHALL only add to the strategy config. It SHALL NOT remove categories from target or avoid lists, SHALL NOT lower edge thresholds below user-specified values, and SHALL NOT modify any field that was explicitly set in `strategy.yaml`.
+
+#### Scenario: Merge does not remove existing avoid categories
+- **GIVEN** `strategy.yaml` has `avoid_categories: ["politics"]` and no hypothesis action targets "politics" for removal
+- **WHEN** strategy config is merged
+- **THEN** "politics" remains in `avoid_categories`

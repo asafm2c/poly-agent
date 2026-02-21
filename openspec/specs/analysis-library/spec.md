@@ -1,105 +1,49 @@
-## ADDED Requirements
+## Purpose
 
-### Requirement: Composable market loading with filtering
-The analysis library SHALL provide a `load_markets()` function that queries the backtest database and returns market records with their price histories. The function SHALL accept optional filters for category, regime, volume range, resolution outcome, and date range.
+Extend the analysis library with functions to query hypothesis evidence alongside simulation results, and to compute hypothesis-specific metrics from trial data. These additions enable hypothesis-aware aggregation -- filtering and grouping simulation results by the hypothesis they were run to test.
 
-#### Scenario: Load all markets
-- **WHEN** `load_markets()` is called with no filters
-- **THEN** all markets with price history in the backtest DB are returned with their metadata and daily candles
+## MODIFIED Requirements
 
-#### Scenario: Load by category and regime
-- **WHEN** `load_markets(category="crypto", regime="o1-era")` is called
-- **THEN** only crypto markets that resolved during the o1-era regime period are returned
+### Requirement: Hypothesis evidence aggregation
+The analysis library SHALL provide a `hypothesis_evidence_summary()` function that loads all evidence records for a given hypothesis ID and returns aggregate metrics: total trial count, weighted Brier diff, weighted confidence, number of supporting vs contradicting evidence records, and the most recent evidence date.
 
-#### Scenario: Load by volume range
-- **WHEN** `load_markets(volume_min=5000, volume_max=500000)` is called
-- **THEN** only markets within that volume range are returned
+#### Scenario: Summary for hypothesis with multiple evidence records
+- **GIVEN** a hypothesis with ID 1 that has 3 evidence records from different simulation runs
+- **WHEN** `hypothesis_evidence_summary(hypothesis_id=1)` is called
+- **THEN** the function returns a dict with `total_trial_count`, `weighted_brier_diff`, `weighted_confidence`, `supporting_count`, `contradicting_count`, `inconclusive_count`, `latest_evidence_date`, and `evidence_count`
 
-### Requirement: Market efficiency index measures pricing accuracy
-The analysis library SHALL provide an `efficiency_index()` function that computes the average absolute deviation between market price and resolution outcome at specified time horizons before resolution. Lower values indicate more efficient markets.
+#### Scenario: Summary for hypothesis with no evidence
+- **GIVEN** a hypothesis with ID 5 that has zero evidence records (status='proposed')
+- **WHEN** `hypothesis_evidence_summary(hypothesis_id=5)` is called
+- **THEN** the function returns a dict with all counts at 0, `weighted_brier_diff=0.0`, `weighted_confidence=0.0`, and `latest_evidence_date=None`
 
-#### Scenario: Efficiency at multiple horizons
-- **WHEN** `efficiency_index(markets, horizons=[30, 7, 1])` is called
-- **THEN** the function returns the mean |price - outcome| at 30 days, 7 days, and 1 day before resolution for each market set
+### Requirement: Hypothesis-filtered simulation metrics
+The analysis library SHALL provide a `simulation_by_hypothesis()` function that groups trial results from all simulation runs linked to a specific hypothesis, returning aggregate metrics across those runs.
 
-#### Scenario: Efficiency compared across regimes
-- **WHEN** efficiency is computed per regime
-- **THEN** the results show whether markets became more efficiently priced in later regimes (evidence of improving prediction quality, potentially from LLM agents)
+#### Scenario: Metrics across hypothesis-linked runs
+- **GIVEN** a hypothesis with ID 2 linked to 3 simulation runs totaling 80 trials
+- **WHEN** `simulation_by_hypothesis(hypothesis_id=2)` is called
+- **THEN** the function returns a dict with `agent_brier`, `market_brier`, `brier_diff`, `trial_count`, `simulated_pnl`, `trade_count`, and `win_rate` aggregated across all 80 trials from those 3 runs
 
-#### Scenario: Efficiency compared across categories within a regime
-- **WHEN** efficiency is computed per category within a single regime
-- **THEN** the results show which categories are most and least efficiently priced, identifying where mispricings are plausible
+#### Scenario: No linked simulation runs
+- **GIVEN** a hypothesis with ID 3 that has no linked simulation runs
+- **WHEN** `simulation_by_hypothesis(hypothesis_id=3)` is called
+- **THEN** the function returns a dict with `trial_count=0` and all metrics as None
 
-### Requirement: Category calibration measures systematic bias
-The analysis library SHALL provide a `category_calibration()` function that computes per-category calibration: average market price vs average resolution outcome. Non-zero bias indicates systematic over- or under-pricing.
+### Requirement: Paired statistical comparison
+The analysis library SHALL provide a `compute_paired_stats()` function that computes a paired t-test p-value and Cohen's d effect size from per-trial Brier scores for a given simulation run. This function SHALL use a normal approximation for the p-value (no scipy dependency) and SHALL require a minimum of 5 trials.
 
-#### Scenario: Category with bullish bias
-- **WHEN** markets in category "crypto" have an average final price of 0.55 but average resolution of 0.40
-- **THEN** `category_calibration()` returns a bias of +0.15 for crypto (market overestimates YES)
+#### Scenario: Sufficient trials for paired test
+- **GIVEN** a simulation run with 40 trials that all have `agent_brier` and `market_brier` values
+- **WHEN** `compute_paired_stats(run_id=1)` is called
+- **THEN** the function returns a tuple of `(p_value, effect_size)` where `p_value` is a float in [0, 1] and `effect_size` (Cohen's d) is a float
 
-#### Scenario: Well-calibrated category
-- **WHEN** markets in a category have average price within 0.02 of average resolution
-- **THEN** the calibration function reports near-zero bias for that category
+#### Scenario: Insufficient trials
+- **GIVEN** a simulation run with only 3 valid trials
+- **WHEN** `compute_paired_stats(run_id=1)` is called
+- **THEN** the function returns `(None, None)`
 
-#### Scenario: Calibration by regime
-- **WHEN** `category_calibration(regime="o1-era")` is called
-- **THEN** only markets from that regime are included, enabling tracking of whether biases persist or correct over time
-
-### Requirement: Price momentum signal detects directional trends
-The analysis library SHALL provide a `price_momentum()` function that computes directional price movement over a configurable lookback window relative to a measurement point.
-
-#### Scenario: Upward momentum computed
-- **WHEN** a market's price increased by more than 0.05 over 7 days before a measurement point
-- **THEN** the momentum function returns a positive value for that market
-
-#### Scenario: Momentum validated against outcomes
-- **WHEN** momentum is computed across all markets at 7 days before resolution
-- **THEN** the results can be compared against actual outcomes to determine whether momentum predicts resolution direction
-
-### Requirement: Cross-market arbitrage detects event-level inconsistencies
-The analysis library SHALL provide a `cross_market_arbitrage()` function that detects when markets within the same event have YES prices summing to significantly more or less than 1.0 for mutually exclusive outcomes.
-
-#### Scenario: Overpriced event detected
-- **WHEN** an event has 3 mutually exclusive markets whose YES prices sum to 1.15
-- **THEN** the function flags this event with a +0.15 deviation
-
-#### Scenario: Single-market events skipped
-- **WHEN** an event has only one market
-- **THEN** the function returns no signal (not applicable)
-
-### Requirement: Market baseline Brier score as null hypothesis
-The analysis library SHALL provide a `market_baseline_brier()` function that computes the Brier score of using the market price at a specified horizon as the prediction. This serves as the baseline that any analysis must beat to demonstrate value.
-
-#### Scenario: Baseline at 7 days before resolution
-- **WHEN** `market_baseline_brier(markets, horizon=7)` is called
-- **THEN** the function returns mean((price_at_7d - outcome)^2) across all markets with price data at that horizon
-
-#### Scenario: Baseline compared to signal
-- **WHEN** a signal's Brier score is lower than the market baseline
-- **THEN** the signal demonstrates positive alpha (better predictive accuracy than the market price)
-
-### Requirement: Regime comparison function
-The analysis library SHALL provide a `regime_comparison()` function that runs any analysis function across all regimes and returns a side-by-side comparison, enabling trend detection.
-
-#### Scenario: Efficiency trend across regimes
-- **WHEN** `regime_comparison(efficiency_index, horizons=[7])` is called
-- **THEN** the efficiency index is computed for each regime and returned in chronological order, making efficiency trends visible
-
-#### Scenario: Category calibration evolution
-- **WHEN** `regime_comparison(category_calibration)` is called
-- **THEN** category biases are shown per regime, revealing whether biases are correcting over time
-
-### Requirement: Analysis functions callable from any context
-All analysis functions SHALL work when called from Python scripts, CLI commands, Jupyter notebooks, or by LLM agents via bash tool calls. Functions SHALL accept standard Python arguments and return structured dictionaries or lists, not print to stdout. `run_simulation()` and `run_multi_model_evaluation()` SHALL internally use async concurrency but their public signatures SHALL remain synchronous — callers do not need to manage an event loop.
-
-#### Scenario: LLM agent runs ad-hoc analysis
-- **WHEN** an LLM agent executes `python3 -c "from polymarket_agent.backtest.analysis import *; print(category_calibration(load_markets(regime='o1-era')))"`
-- **THEN** the analysis runs and returns structured results to stdout
-
-#### Scenario: Human uses in notebook
-- **WHEN** a human imports analysis functions in a Jupyter notebook
-- **THEN** the functions return data structures suitable for further manipulation, plotting, or tabulation
-
-#### Scenario: run_simulation called synchronously
-- **WHEN** `run_simulation(markets, model="claude-sonnet-4-6")` is called from a synchronous context
-- **THEN** the function blocks until all trials complete and returns the run_id, with no asyncio boilerplate required from the caller
+#### Scenario: All trials agree (zero variance edge case)
+- **GIVEN** a simulation run where all per-trial Brier diffs are identical
+- **WHEN** `compute_paired_stats()` is called
+- **THEN** the function handles the zero-variance case gracefully (uses a small epsilon for standard deviation) and returns a valid p_value and effect_size

@@ -71,14 +71,14 @@
 
 - [x] 8.1 Test hypothesis CRUD — TestHypothesisCRUD (5 tests), TestHypothesisSchema (4 tests)
 - [x] 8.2 Test status transitions — TestHypothesisEvaluation (4 tests)
-- [ ] 8.3 Test confidence decay formula
+- [x] 8.3 Test confidence decay formula
 - [x] 8.4 Test evidence recording — TestHypothesisCRUD::test_record_evidence
 - [x] 8.5 Test `_compute_weighted_confidence()` — TestWeightedConfidence (4 tests)
-- [ ] 8.6 Test `_compute_weighted_brier_diff()`
+- [x] 8.6 Test `_compute_weighted_brier_diff()`
 - [x] 8.7 Test action lifecycle — TestHypothesisActions (3 tests)
 - [x] 8.8 Test `load_active_hypothesis_actions()` — TestHypothesisActions (3 tests)
 - [x] 8.9 Test `_merge_hypothesis_actions()` — TestMergeHypothesisActions (5 tests)
-- [ ] 8.10 Test `build_recommendation()` with weight_adjustment
+- [x] 8.10 Test `build_recommendation()` with weight_adjustment
 - [x] 8.11 Test `export_calibration_for_llm()` with hypotheses — TestCalibrationWithHypotheses (2 tests)
 - [x] 8.12 Test `seed_hypotheses()` idempotency — TestHypothesisSchema::test_seed_hypotheses_idempotent
 - [x] 8.13 CLI smoke tests — TestHypothesisCLI (3 tests)

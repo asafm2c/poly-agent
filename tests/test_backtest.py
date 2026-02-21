@@ -1821,6 +1821,222 @@ class TestHypothesisCLI:
 
 
 # ---------------------------------------------------------------------------
+# Task 8.3 — Confidence decay formula
+# ---------------------------------------------------------------------------
+
+
+class TestDecayCheckFormula:
+    """Tests for exponential confidence decay in decay_check()."""
+
+    def test_decay_formula_matches_expected(self):
+        """decay_check() applies base_confidence * (0.5 ** (days_elapsed / half_life))."""
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+        from polymarket_agent.backtest.hypothesis import decay_check, propose, record_evidence
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        # Propose and manually promote to 'confirmed' with known confidence
+        hyp_id = propose("decay-formula-test", "Decay formula test", db_path=TEST_BACKTEST_DB)
+
+        # Insert a simulation run for FK
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute("INSERT INTO bt_simulation_runs (id, started_at, config) VALUES (1, 'now', '{}')")
+
+        # Record evidence dated exactly 90 days in the past (one half-life)
+        past_date = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                """INSERT INTO bt_hypothesis_evidence
+                (hypothesis_id, run_id, recorded_at, trial_count,
+                 agent_brier, market_brier, brier_diff, supports_hypothesis)
+                VALUES (?, 1, ?, 50, 0.10, 0.20, -0.10, 1)""",
+                (hyp_id, past_date),
+            )
+            # Manually set status to 'confirmed' and a known confidence_score
+            conn.execute(
+                "UPDATE bt_hypotheses SET status = 'confirmed', confidence_score = 0.8 WHERE id = ?",
+                (hyp_id,),
+            )
+
+        results = decay_check(db_path=TEST_BACKTEST_DB)
+        assert len(results) == 1
+
+        r = results[0]
+        assert r["hypothesis_id"] == hyp_id
+        half_life = r["half_life"]  # default 90
+
+        # The base confidence is recomputed from evidence by _compute_weighted_confidence,
+        # not read from the stored value — so we use r["original_confidence"]
+        base_conf = r["original_confidence"]
+        days_elapsed = r["days_since_evidence"]  # int cast of actual elapsed
+
+        # Recompute expected using the same formula as the implementation
+        expected = base_conf * (0.5 ** (days_elapsed / half_life))
+        assert r["decayed_confidence"] == pytest.approx(expected, rel=1e-6)
+
+        # At 90 days elapsed and half_life=90, decay factor is 0.5
+        # so decayed should be approximately half of base
+        assert r["decayed_confidence"] == pytest.approx(base_conf * 0.5, rel=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Task 8.6 — _compute_weighted_brier_diff() unit test
+# ---------------------------------------------------------------------------
+
+
+class TestComputeWeightedBrierDiff:
+    """Direct unit tests for _compute_weighted_brier_diff()."""
+
+    def test_empty_returns_zero(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_brier_diff
+        result, n = _compute_weighted_brier_diff([])
+        assert result == 0.0
+        assert n == 0
+
+    def test_all_none_brier_diff_returns_zero(self):
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_brier_diff
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {"brier_diff": None, "trial_count": 50, "recorded_at": now},
+            {"brier_diff": None, "trial_count": 30, "recorded_at": now},
+        ]
+        result, n = _compute_weighted_brier_diff(rows)
+        assert result == 0.0
+        assert n == 0
+
+    def test_fresh_evidence_weight_near_one(self):
+        """With age~0 days, weight~1.0, so result ~= simple weighted average."""
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_brier_diff
+
+        now = datetime.now(timezone.utc).isoformat()
+        # Two rows with fresh timestamps — age_days ~ 0, weight ~ 1/(1+0) = 1.0
+        rows = [
+            {"brier_diff": -0.04, "trial_count": 40, "recorded_at": now},
+            {"brier_diff": -0.02, "trial_count": 20, "recorded_at": now},
+        ]
+        result, effective_n = _compute_weighted_brier_diff(rows)
+
+        # With weight~1.0:
+        #   weighted_diff = (-0.04 * 1 * 40) + (-0.02 * 1 * 20) = -1.6 + -0.4 = -2.0
+        #   total_weight  = 1 * 40 + 1 * 20 = 60
+        #   result = -2.0 / 60 ~ -0.0333
+        #   effective_n = int(40 * 1 + 20 * 1) = 60
+        assert result == pytest.approx(-2.0 / 60, rel=0.01)
+        assert effective_n == pytest.approx(60, abs=2)  # allow rounding
+
+    def test_older_evidence_down_weighted(self):
+        """Evidence from 30 days ago has weight 0.5; effective_n is reduced."""
+        from polymarket_agent.backtest.hypothesis import _compute_weighted_brier_diff
+
+        now_ts = datetime.now(timezone.utc)
+        fresh = now_ts.isoformat()
+        old = (now_ts - timedelta(days=30)).isoformat()
+
+        # Fresh row: weight ~ 1.0; old row: weight ~ 1/(1+30/30) = 0.5
+        rows = [
+            {"brier_diff": -0.06, "trial_count": 50, "recorded_at": fresh},
+            {"brier_diff": -0.02, "trial_count": 50, "recorded_at": old},
+        ]
+        result, effective_n = _compute_weighted_brier_diff(rows)
+
+        # weighted_diff = (-0.06 * 1.0 * 50) + (-0.02 * 0.5 * 50) = -3.0 + -0.5 = -3.5
+        # total_weight  = 1.0 * 50 + 0.5 * 50 = 75
+        # expected ~ -3.5 / 75 ~ -0.04667
+        # effective_n = int(50*1.0 + 50*0.5) = int(75) = 75
+        expected_diff = (-0.06 * 1.0 * 50 + -0.02 * 0.5 * 50) / (1.0 * 50 + 0.5 * 50)
+        assert result == pytest.approx(expected_diff, rel=0.02)
+        assert effective_n == pytest.approx(75, abs=3)
+
+
+# ---------------------------------------------------------------------------
+# Task 8.10 — build_recommendation() with weight_adjustment
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRecommendationWeightAdjustment:
+    """Tests for hypothesis weight_adjustment actions in build_recommendation()."""
+
+    def _make_market_and_estimate(self, market_id="wa-test-market"):
+        """Return a Market and ProbabilityEstimate with clear edge to guarantee a recommendation."""
+        from polymarket_agent.models import Market, ProbabilityEstimate
+
+        market = Market(
+            id=market_id,
+            question="Will the weight adjustment test pass?",
+            volume=10000.0,  # Low volume → lower edge threshold
+            last_price_yes=0.30,
+            last_price_no=0.70,
+        )
+        estimate = ProbabilityEstimate(
+            market_id=market_id,
+            final_estimate=0.70,   # Agent 70%, market 30% → strong YES edge
+            confidence_low=0.60,
+            confidence_high=0.80,
+            base_rate=0.50,
+            updated_estimate=0.70,
+            pass1_reasoning="Strong edge for test",
+            pass2_reasoning="Confirmed by test setup",
+            thesis="Test edge",
+        )
+        return market, estimate
+
+    def test_weight_adjustment_increases_position_size(self):
+        """Strategy config with weight_adjustment(kelly_multiplier=2.0, strength=1.0) doubles size."""
+        from polymarket_agent.trading.edge import build_recommendation
+
+        market, estimate = self._make_market_and_estimate()
+        bankroll = 1000.0
+
+        # First call: no strategy config
+        rec_plain, _, _ = build_recommendation(market, estimate, bankroll)
+        assert rec_plain is not None, "Expected a recommendation with no strategy_config"
+
+        # Second call: weight_adjustment with kelly_multiplier=2.0, effective_strength=1.0
+        strategy_config = {
+            "hypothesis_actions": [
+                {
+                    "action_type": "weight_adjustment",
+                    "config": {"kelly_multiplier": 2.0},
+                    "effective_strength": 1.0,
+                }
+            ]
+        }
+        rec_adjusted, _, _ = build_recommendation(
+            market, estimate, bankroll, strategy_config=strategy_config
+        )
+        assert rec_adjusted is not None, "Expected a recommendation with weight_adjustment config"
+
+        # multiplier = 1.0 + (2.0 - 1.0) * 1.0 = 2.0 → size should double
+        assert rec_adjusted.recommended_size > rec_plain.recommended_size
+
+    def test_weight_adjustment_zero_strength_no_change(self):
+        """effective_strength=0.0 makes multiplier=1.0 so size is unchanged."""
+        from polymarket_agent.trading.edge import build_recommendation
+
+        market, estimate = self._make_market_and_estimate(market_id="wa-zero-strength")
+        bankroll = 1000.0
+
+        rec_plain, _, _ = build_recommendation(market, estimate, bankroll)
+        assert rec_plain is not None
+
+        strategy_config = {
+            "hypothesis_actions": [
+                {
+                    "action_type": "weight_adjustment",
+                    "config": {"kelly_multiplier": 2.0},
+                    "effective_strength": 0.0,  # no effect
+                }
+            ]
+        }
+        rec_zero, _, _ = build_recommendation(
+            market, estimate, bankroll, strategy_config=strategy_config
+        )
+        assert rec_zero is not None
+        # multiplier = 1.0 + (2.0 - 1.0) * 0.0 = 1.0 → size should be the same
+        assert rec_zero.recommended_size == rec_plain.recommended_size
+
+
+# ---------------------------------------------------------------------------
 # Parallel Trial Execution Tests
 # ---------------------------------------------------------------------------
 
