@@ -52,8 +52,8 @@
 
 ## 7. Tests
 
-- [ ] 7.1 Test BacktestDB.create() returns None for missing file
-- [ ] 7.2 Test evaluation API endpoints with test backtest.db fixture
-- [ ] 7.3 Test hypotheses API endpoints (graceful degradation when no tables)
-- [ ] 7.4 Test app creation with new routers
-- [ ] 7.5 Smoke test for dashboard serving static files with new tabs
+- [x] 7.1 Test BacktestDB.create() returns None for missing file
+- [x] 7.2 Test evaluation API endpoints with test backtest.db fixture
+- [x] 7.3 Test hypotheses API endpoints (graceful degradation when no tables)
+- [x] 7.4 Test app creation with new routers
+- [x] 7.5 Smoke test for dashboard serving static files with new tabs
