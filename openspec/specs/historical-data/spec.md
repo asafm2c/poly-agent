@@ -42,7 +42,7 @@ The backtest database SHALL use a separate SQLite file (`backtest.db`) with its 
 - **THEN** the `bt_regimes` table is populated with known regime boundaries: pre-GPT4 (before 2023-03-14), GPT4-era (2023-03-14 to 2024-03-04), Claude3-era (2024-03-04 to 2024-05-13), GPT4o-era (2024-05-13 to 2024-09-12), o1-era (2024-09-12 to 2025-06-25), and post-Claude4 (2025-06-25 onward)
 
 ### Requirement: Collection progress tracking and resumption
-The system SHALL track collection progress so that interrupted runs can resume without re-fetching already-collected data.
+The system SHALL track collection progress so that interrupted runs can resume without re-fetching already-collected data. Every collection run SHALL be recorded in `bt_import_jobs` with progress counters updated per batch, enabling external observers (dashboard, CLI) to monitor status without blocking the collection process.
 
 #### Scenario: Interrupted collection resumes
 - **WHEN** collection is interrupted after fetching 5,000 of 30,000 markets' price histories
@@ -51,3 +51,15 @@ The system SHALL track collection progress so that interrupted runs can resume w
 #### Scenario: Collection progress logged
 - **WHEN** collection is in progress
 - **THEN** the system logs progress every 100 markets: "Collected 100/30000 markets (0.3%), 15 skipped (no tokens)"
+
+#### Scenario: Collection progress written to bt_import_jobs
+- **WHEN** collection is in progress
+- **THEN** the `bt_import_jobs` row for the current run is updated with current `markets_done`, `histories_done`, `histories_skipped`, and `updated_at` at least every 50 records
+
+#### Scenario: Job row status reflects terminal state
+- **WHEN** collection completes successfully
+- **THEN** the job row has `status='done'` and `completed_at` set
+
+#### Scenario: Job row reflects cancellation via SIGTERM
+- **WHEN** the collection process receives SIGTERM
+- **THEN** the job row has `status='cancelled'` before the process exits
