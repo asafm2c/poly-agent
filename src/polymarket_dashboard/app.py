@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from polymarket_dashboard.db import BacktestDB, DashboardDB
 from polymarket_dashboard.routes import (
     calibration,
+    data,
     evaluation,
     hypotheses,
     metrics,
@@ -35,6 +36,7 @@ def create_app(db_path: Path | None = None, backtest_db_path: Path | None = None
     app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
     app.include_router(evaluation.router, prefix="/api/evaluation", tags=["evaluation"])
     app.include_router(hypotheses.router, prefix="/api/hypotheses", tags=["hypotheses"])
+    app.include_router(data.router, prefix="/api/data", tags=["data"])
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static_dir, html=True))
