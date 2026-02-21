@@ -2,6 +2,9 @@
 
 import json
 import logging
+import os
+import signal
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -16,6 +19,10 @@ GAMMA_BATCH_SIZE = 500
 MAX_BACKOFF = 60
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 class BacktestCollector:
     """Collects resolved markets and daily price histories into the backtest DB."""
 
@@ -23,31 +30,116 @@ class BacktestCollector:
         self.db_path = db_path or settings.backtest_db_path
         self._gamma = httpx.Client(base_url=settings.gamma_api_url, timeout=60.0)
         self._clob = httpx.Client(base_url=settings.clob_api_url, timeout=30.0)
+        self._job_id: int | None = None
         init_backtest_db(self.db_path)
+
+        # Install SIGTERM handler: mark job cancelled then exit cleanly
+        def _sigterm_handler(sig, frame):
+            if self._job_id is not None:
+                try:
+                    self._update_job(status="cancelled")
+                except Exception:
+                    pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
     def close(self):
         self._gamma.close()
         self._clob.close()
 
-    def collect(self) -> dict:
+    # ------------------------------------------------------------------
+    # Job tracking helpers
+    # ------------------------------------------------------------------
+
+    def _create_job(self, job_type: str, params: dict, job_id: int | None = None) -> int:
+        """Create or adopt a bt_import_jobs row. Returns job_id."""
+        now = _now_iso()
+        with get_backtest_db(self.db_path) as conn:
+            # Mark any existing running jobs as stalled
+            conn.execute(
+                "UPDATE bt_import_jobs SET status='stalled', updated_at=? WHERE status='running'",
+                (now,),
+            )
+            if job_id is not None:
+                # Adopt existing row (dashboard pre-created it)
+                conn.execute(
+                    """UPDATE bt_import_jobs
+                    SET status='running', pid=?, started_at=?, updated_at=?,
+                        markets_done=0, histories_done=0, histories_skipped=0,
+                        completed_at=NULL, error_msg=NULL
+                    WHERE id=?""",
+                    (os.getpid(), now, now, job_id),
+                )
+                self._job_id = job_id
+            else:
+                cursor = conn.execute(
+                    """INSERT INTO bt_import_jobs
+                        (job_type, status, params_json, pid, started_at, updated_at)
+                    VALUES (?, 'running', ?, ?, ?, ?)""",
+                    (job_type, json.dumps(params), os.getpid(), now, now),
+                )
+                self._job_id = cursor.lastrowid
+        return self._job_id
+
+    def _update_job(self, **fields) -> None:
+        """Update the current job row with the given fields + updated_at."""
+        if self._job_id is None:
+            return
+        fields["updated_at"] = _now_iso()
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        values = list(fields.values()) + [self._job_id]
+        with get_backtest_db(self.db_path) as conn:
+            conn.execute(
+                f"UPDATE bt_import_jobs SET {set_clause} WHERE id=?",
+                values,
+            )
+
+    # ------------------------------------------------------------------
+    # Public collection API
+    # ------------------------------------------------------------------
+
+    def collect(self, job_id: int | None = None) -> dict:
         """Run full collection: markets then price histories.
 
         Returns summary dict with counts.
         """
-        markets_collected = self._collect_markets()
-        history_collected, history_skipped = self._collect_price_histories()
-        return {
-            "markets_collected": markets_collected,
-            "history_collected": history_collected,
-            "history_skipped": history_skipped,
-        }
+        self._create_job("full", {}, job_id=job_id)
+        try:
+            markets_collected = self._collect_markets()
+            history_collected, history_skipped = self._collect_price_histories()
+            self._update_job(status="done", completed_at=_now_iso())
+            return {
+                "markets_collected": markets_collected,
+                "history_collected": history_collected,
+                "history_skipped": history_skipped,
+                "job_id": self._job_id,
+            }
+        except Exception as e:
+            self._update_job(status="failed", error_msg=str(e))
+            raise
 
-    def collect_histories_only(self, min_volume: float | None = None) -> tuple[int, int]:
+    def collect_histories_only(
+        self, min_volume: float | None = None, job_id: int | None = None
+    ) -> tuple[int, int]:
         """Run only price history collection, optionally filtered by volume.
 
         Returns (collected, skipped) counts.
         """
-        return self._collect_price_histories(min_volume=min_volume)
+        job_type = "histories_filtered" if min_volume is not None else "histories"
+        params = {"min_volume": min_volume} if min_volume is not None else {}
+        self._create_job(job_type, params, job_id=job_id)
+        try:
+            result = self._collect_price_histories(min_volume=min_volume)
+            self._update_job(status="done", completed_at=_now_iso())
+            return result
+        except Exception as e:
+            self._update_job(status="failed", error_msg=str(e))
+            raise
+
+    # ------------------------------------------------------------------
+    # Internal collection logic
+    # ------------------------------------------------------------------
 
     def _collect_markets(self) -> int:
         """Paginate Gamma API for all resolved markets, upsert into bt_markets."""
@@ -76,6 +168,9 @@ class BacktestCollector:
 
             total += batch_count
             offset += GAMMA_BATCH_SIZE
+
+            # Update job progress after each batch
+            self._update_job(markets_done=total)
 
             if total % 500 == 0 or len(data) < GAMMA_BATCH_SIZE:
                 logger.info("Markets collected: %d (offset=%d)", total, offset)
@@ -210,6 +305,9 @@ class BacktestCollector:
         skipped = 0
         no_token_count = 0
 
+        # Set total upfront for progress tracking
+        self._update_job(histories_total=total)
+
         for i, row in enumerate(rows):
             market_id = row["id"]
             token_id = row["yes_token"]
@@ -255,11 +353,16 @@ class BacktestCollector:
             collected += 1
 
             processed = collected + skipped
+            if processed % 50 == 0 or processed <= 10:
+                self._update_job(histories_done=collected, histories_skipped=skipped)
             if processed % 100 == 0 or processed <= 10:
                 logger.info(
                     "Price history: %d collected, %d skipped, %d/%d processed",
                     collected, skipped, processed, total,
                 )
+
+        # Final progress update
+        self._update_job(histories_done=collected, histories_skipped=skipped)
 
         logger.info(
             "Price history collection complete: %d collected, %d skipped, %d no tokens",

@@ -88,6 +88,40 @@
       font-style: italic;
     }
 
+    /* Import jobs */
+    .import-option {
+      display: block; width: 100%; padding: 8px 14px; background: none; border: none;
+      color: var(--fg); cursor: pointer; text-align: left; font-size: 0.9rem;
+    }
+    .import-option:hover { background: rgba(255,255,255,0.08); }
+    .job-row {
+      border: 1px solid #2a2a3e; border-radius: 6px; padding: 12px 14px;
+      margin-bottom: 10px; background: rgba(255,255,255,0.02);
+    }
+    .job-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+    .job-badge {
+      font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 20px;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .badge-running  { background: #1d4ed8; color: #bfdbfe; }
+    .badge-done     { background: #166534; color: #bbf7d0; }
+    .badge-failed   { background: #991b1b; color: #fecaca; }
+    .badge-stalled  { background: #92400e; color: #fde68a; }
+    .badge-cancelled{ background: #374151; color: #9ca3af; }
+    .badge-pending  { background: #374151; color: #9ca3af; }
+    .job-progress-bar {
+      height: 6px; border-radius: 3px; background: #2a2a3e; margin: 6px 0;
+    }
+    .job-progress-fill { height: 100%; border-radius: 3px; background: #3b82f6; transition: width 0.3s; }
+    .job-meta { font-size: 0.78rem; color: var(--muted); }
+    .job-error { font-size: 0.8rem; color: #f87171; margin-top: 4px; }
+    .btn-cancel {
+      font-size: 0.75rem; padding: 2px 10px; background: #7f1d1d; color: #fecaca;
+      border: none; border-radius: 4px; cursor: pointer; margin-left: auto;
+    }
+    .btn-cancel:hover { background: #991b1b; }
+    .btn-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
+
     /* Price history expand */
     .expand-btn {
       background: none; border: none; color: #3b82f6; cursor: pointer;
@@ -323,6 +357,22 @@
         <div class="chart-title">Resolution Date Distribution (by LLM Era)</div>
         <div id="data-temporal-chart" style="height:320px;"></div>
       </div>
+
+      <!-- Import Jobs section -->
+      <div class="chart-container" id="import-jobs-section">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <div class="chart-title" style="margin:0;">Import Jobs</div>
+          <div style="position:relative;display:inline-block;">
+            <button id="import-btn" class="btn" onclick="document.getElementById('import-menu').style.display=document.getElementById('import-menu').style.display==='block'?'none':'block'">New Import ▾</button>
+            <div id="import-menu" style="display:none;position:absolute;right:0;top:100%;background:#1e1e2e;border:1px solid #333;border-radius:6px;z-index:100;min-width:200px;">
+              <button class="import-option" onclick="startImport('full')">Full collection</button>
+              <button class="import-option" onclick="startImport('histories')">Histories only</button>
+              <button class="import-option" onclick="startImport('histories_filtered')">Histories ≥ $100K</button>
+            </div>
+          </div>
+        </div>
+        <div id="import-jobs-list"><div class="empty-state">Loading import jobs...</div></div>
+      </div>
     </div>
   </main>
 
@@ -330,6 +380,7 @@
     // --- State ---
     let activeTab = 'portfolio';
     const REFRESH_MS = 30000;
+    let _jobsPollTimer = null;
     const PLOTLY_DARK = {
       paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
       font: { color: '#94a3b8', size: 11 },
@@ -1308,7 +1359,153 @@
       } else {
         $('#data-temporal-chart').innerHTML = '<div class="empty-state">No temporal data.</div>';
       }
+
+      await refreshJobsSection();
     }
+
+    // --- Import Jobs ---
+
+    function _jobBadge(job) {
+      const label = job.stale ? 'stalled' : job.status;
+      return `<span class="job-badge badge-${label}">${label}</span>`;
+    }
+
+    function _fmtDuration(secs) {
+      if (secs == null) return '-';
+      if (secs >= 3600) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+      if (secs >= 60) return `${Math.floor(secs / 60)}m ${Math.floor(secs % 60)}s`;
+      return `${Math.floor(secs)}s`;
+    }
+
+    function _renderJob(job) {
+      const isRunning = job.status === 'running' && !job.stale;
+      const hasProgress = job.histories_total > 0;
+
+      let progressHtml = '';
+      if (hasProgress) {
+        const pct = job.progress_pct ?? 0;
+        const rate = job.rate ? `${job.rate}/s` : '';
+        let eta = '';
+        if (isRunning && job.rate && job.histories_total > 0) {
+          const remaining = job.histories_total - job.histories_done;
+          const etaSecs = Math.round(remaining / job.rate);
+          eta = ` · ETA ${_fmtDuration(etaSecs)}`;
+        }
+        progressHtml = `
+          <div class="job-progress-bar">
+            <div class="job-progress-fill" style="width:${pct}%"></div>
+          </div>
+          <div class="job-meta">${job.histories_done.toLocaleString()} / ${job.histories_total.toLocaleString()} histories (${pct}%)${rate ? ' · ' + rate : ''}${eta}</div>`;
+      } else if (job.markets_done > 0) {
+        progressHtml = `<div class="job-meta">Markets collected: ${job.markets_done.toLocaleString()}</div>`;
+      }
+
+      const cancelBtn = isRunning
+        ? `<button class="btn-cancel" id="cancel-btn-${job.id}" onclick="cancelJob(${job.id})">Cancel</button>`
+        : '';
+
+      const errorHtml = job.error_msg
+        ? `<div class="job-error">Error: ${job.error_msg}</div>`
+        : '';
+
+      const started = job.started_at ? job.started_at.slice(0, 16).replace('T', ' ') : '-';
+      const duration = _fmtDuration(job.duration_seconds);
+
+      return `<div class="job-row">
+        <div class="job-header">
+          ${_jobBadge(job)}
+          <span style="font-size:0.85rem;font-weight:500;">${job.job_type}</span>
+          <span class="job-meta" style="margin-left:4px;">· ${started} · ${duration}</span>
+          ${cancelBtn}
+        </div>
+        ${progressHtml}
+        ${errorHtml}
+      </div>`;
+    }
+
+    async function refreshJobsSection() {
+      const data = await api('/data/jobs');
+      const el = $('#import-jobs-list');
+      if (!data || !data.available) {
+        el.innerHTML = '<div class="empty-state">No import jobs yet — use \'New Import\' to start a collection.</div>';
+        _stopJobsPolling();
+        return;
+      }
+      const jobs = data.jobs || [];
+      if (jobs.length === 0) {
+        el.innerHTML = '<div class="empty-state">No import jobs yet — use \'New Import\' to start a collection.</div>';
+        _stopJobsPolling();
+        return;
+      }
+      el.innerHTML = jobs.map(_renderJob).join('');
+
+      // Auto-poll while any job is running
+      const hasRunning = jobs.some(j => j.status === 'running' && !j.stale);
+      if (hasRunning) {
+        _startJobsPolling();
+      } else {
+        _stopJobsPolling();
+      }
+    }
+
+    function _startJobsPolling() {
+      if (_jobsPollTimer) return;
+      _jobsPollTimer = setInterval(async () => {
+        const data = await api('/data/jobs');
+        if (!data || !data.available) return;
+        const jobs = data.jobs || [];
+        const el = $('#import-jobs-list');
+        if (jobs.length === 0) { _stopJobsPolling(); return; }
+        el.innerHTML = jobs.map(_renderJob).join('');
+        if (!jobs.some(j => j.status === 'running' && !j.stale)) _stopJobsPolling();
+      }, 5000);
+    }
+
+    function _stopJobsPolling() {
+      if (_jobsPollTimer) { clearInterval(_jobsPollTimer); _jobsPollTimer = null; }
+    }
+
+    async function startImport(type) {
+      document.getElementById('import-menu').style.display = 'none';
+      const body = { type };
+      if (type === 'histories_filtered') body.min_volume = 100000;
+      try {
+        const res = await fetch('/api/data/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const json = await res.json();
+        if (!res.ok) {
+          alert('Import error: ' + (json.error || res.statusText));
+          return;
+        }
+        await refreshJobsSection();
+        _startJobsPolling();
+      } catch (err) {
+        alert('Import failed: ' + err.message);
+      }
+    }
+
+    async function cancelJob(jobId) {
+      const btn = document.getElementById('cancel-btn-' + jobId);
+      if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+      try {
+        const res = await fetch('/api/data/jobs/' + jobId + '/cancel', { method: 'POST' });
+        const json = await res.json();
+        if (!res.ok) alert('Cancel error: ' + (json.reason || res.statusText));
+      } catch (err) {
+        alert('Cancel failed: ' + err.message);
+      }
+    }
+
+    // Close import menu on outside click
+    document.addEventListener('click', e => {
+      const menu = document.getElementById('import-menu');
+      if (menu && !document.getElementById('import-btn').contains(e.target)) {
+        menu.style.display = 'none';
+      }
+    });
 
     async function refresh() {
       try {

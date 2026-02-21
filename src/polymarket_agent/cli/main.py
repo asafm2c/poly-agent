@@ -411,7 +411,8 @@ def backtest():
 @backtest.command()
 @click.option("--histories-only", is_flag=True, help="Skip market collection, only fetch price histories")
 @click.option("--min-volume", type=float, default=None, help="Only fetch histories for markets above this volume")
-def collect(histories_only: bool, min_volume: float | None):
+@click.option("--job-id", type=int, default=None, help="Use an existing bt_import_jobs row (set by dashboard)")
+def collect(histories_only: bool, min_volume: float | None, job_id: int | None):
     """Collect resolved markets and price histories from Polymarket."""
     from polymarket_agent.backtest.collector import BacktestCollector
 
@@ -419,19 +420,108 @@ def collect(histories_only: bool, min_volume: float | None):
     try:
         if histories_only:
             console.print("Collecting price histories only...")
-            collected, skipped = collector.collect_histories_only(min_volume=min_volume)
+            collected, skipped = collector.collect_histories_only(min_volume=min_volume, job_id=job_id)
             console.print(f"\n[bold green]Collection complete[/]")
             console.print(f"  Price histories collected: {collected}")
             console.print(f"  Skipped: {skipped}")
         else:
             with console.status("Collecting resolved markets..."):
-                result = collector.collect()
+                result = collector.collect(job_id=job_id)
             console.print(f"\n[bold green]Collection complete[/]")
             console.print(f"  Markets collected: {result['markets_collected']}")
             console.print(f"  Price histories collected: {result['history_collected']}")
             console.print(f"  Skipped: {result['history_skipped']}")
+        console.print(f"  Job ID: {collector._job_id}")
     finally:
         collector.close()
+
+
+@backtest.command("jobs")
+def list_jobs():
+    """List recent import jobs from backtest.db."""
+    from polymarket_agent.backtest.database import get_backtest_db
+    from polymarket_agent.config import settings
+    from datetime import datetime, timezone
+    from rich.table import Table
+
+    try:
+        with get_backtest_db(settings.backtest_db_path) as conn:
+            rows = conn.execute(
+                """SELECT id, job_type, status, markets_done, histories_total,
+                          histories_done, histories_skipped, started_at, completed_at, error_msg
+                   FROM bt_import_jobs
+                   ORDER BY id DESC LIMIT 10"""
+            ).fetchall()
+    except Exception as e:
+        console.print(f"[red]Error reading jobs: {e}[/]")
+        return
+
+    if not rows:
+        console.print("No import jobs found.")
+        return
+
+    now = datetime.now(timezone.utc)
+    table = Table(title="Import Jobs", show_lines=False)
+    table.add_column("ID", style="bold", width=5)
+    table.add_column("Type", width=18)
+    table.add_column("Status", width=10)
+    table.add_column("Progress", width=20)
+    table.add_column("Started", width=20)
+    table.add_column("Duration", width=10)
+
+    status_colors = {
+        "running": "blue",
+        "done": "green",
+        "failed": "red",
+        "stalled": "yellow",
+        "cancelled": "dim",
+    }
+
+    for r in rows:
+        status = r["status"]
+        color = status_colors.get(status, "white")
+        status_str = f"[{color}]{status}[/]"
+
+        # Progress
+        if r["histories_total"]:
+            pct = round(r["histories_done"] / r["histories_total"] * 100, 1)
+            progress = f"{r['histories_done']}/{r['histories_total']} ({pct}%)"
+        elif r["markets_done"]:
+            progress = f"markets: {r['markets_done']}"
+        else:
+            progress = "-"
+
+        # Duration
+        started = r["started_at"]
+        end = r["completed_at"]
+        if started:
+            try:
+                start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00")) if end else now
+                secs = int((end_dt - start_dt).total_seconds())
+                if secs >= 3600:
+                    duration = f"{secs // 3600}h {(secs % 3600) // 60}m"
+                elif secs >= 60:
+                    duration = f"{secs // 60}m {secs % 60}s"
+                else:
+                    duration = f"{secs}s"
+            except Exception:
+                duration = "-"
+        else:
+            duration = "-"
+
+        started_display = started[:19].replace("T", " ") if started else "-"
+
+        table.add_row(
+            str(r["id"]),
+            r["job_type"] or "-",
+            status_str,
+            progress,
+            started_display,
+            duration,
+        )
+
+    console.print(table)
 
 
 @backtest.command("analyze")

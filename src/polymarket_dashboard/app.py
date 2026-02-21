@@ -1,6 +1,7 @@
 """Dashboard web server — fully decoupled from the trading engine."""
 
 import os
+import shutil
 from pathlib import Path
 
 import uvicorn
@@ -28,6 +29,8 @@ def create_app(db_path: Path | None = None, backtest_db_path: Path | None = None
     app.state.db = DashboardDB(path)
     app.state.backtest_db = BacktestDB.create(bt_path)
     app.state.starting_balance = float(os.environ.get("PAPER_STARTING_BALANCE", "1000.0"))
+    app.state.uv_cmd = shutil.which("uv")
+    app.state.bt_path = str(bt_path)
 
     app.include_router(portfolio.router, prefix="/api/portfolio", tags=["portfolio"])
     app.include_router(positions.router, prefix="/api/positions", tags=["positions"])

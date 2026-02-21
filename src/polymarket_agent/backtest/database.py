@@ -124,6 +124,24 @@ CREATE TABLE IF NOT EXISTS bt_hypothesis_actions (
     deactivated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS bt_import_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_type TEXT NOT NULL CHECK (job_type IN ('full', 'histories', 'histories_filtered')),
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'done', 'failed', 'stalled', 'cancelled')),
+    params_json TEXT,
+    pid INTEGER,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    markets_total INTEGER,
+    markets_done INTEGER DEFAULT 0,
+    histories_total INTEGER,
+    histories_done INTEGER DEFAULT 0,
+    histories_skipped INTEGER DEFAULT 0,
+    error_msg TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_bt_markets_category ON bt_markets(category);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_end_date ON bt_markets(end_date);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_volume ON bt_markets(volume);
