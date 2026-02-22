@@ -121,17 +121,24 @@ class BacktestCollector:
             raise
 
     def collect_histories_only(
-        self, min_volume: float | None = None, job_id: int | None = None
+        self,
+        min_volume: float | None = None,
+        job_id: int | None = None,
+        market_types: list[str] | None = None,
     ) -> tuple[int, int]:
-        """Run only price history collection, optionally filtered by volume.
+        """Run only price history collection, optionally filtered by volume or market type.
 
         Returns (collected, skipped) counts.
         """
         job_type = "histories_filtered" if min_volume is not None else "histories"
-        params = {"min_volume": min_volume} if min_volume is not None else {}
-        self._create_job(job_type, params, job_id=job_id)
+        params_dict: dict = {}
+        if min_volume is not None:
+            params_dict["min_volume"] = min_volume
+        if market_types is not None:
+            params_dict["market_types"] = market_types
+        self._create_job(job_type, params_dict, job_id=job_id)
         try:
-            result = self._collect_price_histories(min_volume=min_volume)
+            result = self._collect_price_histories(min_volume=min_volume, market_types=market_types)
             self._update_job(status="done", completed_at=_now_iso())
             return result
         except Exception as e:
@@ -289,7 +296,9 @@ class BacktestCollector:
         )
         return True
 
-    def _collect_price_histories(self, min_volume: float | None = None) -> tuple[int, int]:
+    def _collect_price_histories(
+        self, min_volume: float | None = None, market_types: list[str] | None = None
+    ) -> tuple[int, int]:
         """Fetch daily price histories for markets missing them.
 
         Returns (collected, skipped) counts.
@@ -300,6 +309,10 @@ class BacktestCollector:
         if min_volume is not None:
             query += " AND volume >= ?"
             params.append(min_volume)
+        if market_types is not None:
+            placeholders = ",".join("?" * len(market_types))
+            query += f" AND market_type IN ({placeholders})"
+            params.extend(market_types)
         query += " ORDER BY volume DESC"
 
         with get_backtest_db(self.db_path) as conn:

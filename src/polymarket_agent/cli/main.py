@@ -412,7 +412,8 @@ def backtest():
 @click.option("--histories-only", is_flag=True, help="Skip market collection, only fetch price histories")
 @click.option("--min-volume", type=float, default=None, help="Only fetch histories for markets above this volume")
 @click.option("--job-id", type=int, default=None, help="Use an existing bt_import_jobs row (set by dashboard)")
-def collect(histories_only: bool, min_volume: float | None, job_id: int | None):
+@click.option("--market-type", "market_types", multiple=True, help="Restrict history collection to market type (repeatable).")
+def collect(histories_only: bool, min_volume: float | None, job_id: int | None, market_types: tuple[str, ...]):
     """Collect resolved markets and price histories from Polymarket."""
     from polymarket_agent.backtest.collector import BacktestCollector
 
@@ -420,7 +421,11 @@ def collect(histories_only: bool, min_volume: float | None, job_id: int | None):
     try:
         if histories_only:
             console.print("Collecting price histories only...")
-            collected, skipped = collector.collect_histories_only(min_volume=min_volume, job_id=job_id)
+            collected, skipped = collector.collect_histories_only(
+                min_volume=min_volume,
+                job_id=job_id,
+                market_types=list(market_types) if market_types else None,
+            )
             console.print(f"\n[bold green]Collection complete[/]")
             console.print(f"  Price histories collected: {collected}")
             console.print(f"  Skipped: {skipped}")
@@ -731,6 +736,8 @@ def show_strategy():
 @click.option("--concurrency", type=int, default=None, help="Max parallel trials (default: simulation_concurrency setting)")
 @click.option("--market-type", "market_types", multiple=True,
               help="Restrict to market type (repeatable). Default: prediction.")
+@click.option("--no-market-price", "blind", is_flag=True, default=False,
+              help="Hide market price from LLM — measures independent signal only.")
 def simulate_backtest(
     horizon: int,
     count: int,
@@ -741,6 +748,7 @@ def simulate_backtest(
     dry_run: bool,
     concurrency: int | None,
     market_types: tuple[str, ...],
+    blind: bool,
 ):
     """Run LLM estimation against historical markets to measure accuracy."""
     from polymarket_agent.backtest.simulator import run_simulation, select_markets
@@ -757,6 +765,8 @@ def simulate_backtest(
         console.print(f"  Max volume: <= ${max_volume:,.0f}")
     if regime:
         console.print(f"  Regime: {regime}")
+    if blind:
+        console.print(f"  [yellow]BLIND MODE — market price hidden from LLM[/]")
     if dry_run:
         console.print(f"  [yellow]DRY RUN — no LLM calls[/]")
     console.print("")
@@ -801,7 +811,10 @@ def simulate_backtest(
         return
 
     console.print("Running estimation pipeline...\n")
-    result = run_simulation(markets, horizon=horizon, concurrency=concurrency)
+    result = run_simulation(
+        markets, horizon=horizon, concurrency=concurrency,
+        include_market_price=not blind,
+    )
 
     # Summary
     console.print(f"\n[bold green]Simulation Complete (Run #{result['run_id']})[/]")

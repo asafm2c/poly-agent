@@ -169,6 +169,78 @@ class TestCollector:
 
         collector.close()
 
+    def test_collect_histories_only_with_market_type_filter(self):
+        """market_types filter restricts which markets are selected for history collection."""
+        from polymarket_agent.backtest.collector import BacktestCollector
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        with patch("polymarket_agent.backtest.collector.httpx.Client"):
+            collector = BacktestCollector(db_path=TEST_BACKTEST_DB)
+
+        # Insert a prediction market and a sports market, both without history
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                "INSERT INTO bt_markets (id, question, volume, yes_token, has_history, market_type, collected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("pred1", "Will X happen?", 50000, "tok_pred", 0, "prediction", "2024-01-01T00:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO bt_markets (id, question, volume, yes_token, has_history, market_type, collected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("sport1", "Team A vs B?", 50000, "tok_sport", 0, "sports", "2024-01-01T00:00:00"),
+            )
+
+        # Mock _fetch_price_history to return empty (marks has_history=-1)
+        with patch.object(collector, "_fetch_price_history", return_value=[]):
+            collector.collect_histories_only(market_types=["prediction"])
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            pred = conn.execute("SELECT has_history FROM bt_markets WHERE id = 'pred1'").fetchone()
+            sport = conn.execute("SELECT has_history FROM bt_markets WHERE id = 'sport1'").fetchone()
+
+        # prediction market was processed (empty → -1), sports market was not touched (still 0)
+        assert pred["has_history"] == -1
+        assert sport["has_history"] == 0
+
+        collector.close()
+
+    def test_collect_histories_only_without_market_type_filter(self):
+        """Without market_types, all market types are candidates for history collection."""
+        from polymarket_agent.backtest.collector import BacktestCollector
+        from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+        init_backtest_db(TEST_BACKTEST_DB)
+
+        with patch("polymarket_agent.backtest.collector.httpx.Client"):
+            collector = BacktestCollector(db_path=TEST_BACKTEST_DB)
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            conn.execute(
+                "INSERT INTO bt_markets (id, question, volume, yes_token, has_history, market_type, collected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("pred1", "Will X happen?", 50000, "tok_pred", 0, "prediction", "2024-01-01T00:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO bt_markets (id, question, volume, yes_token, has_history, market_type, collected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("sport1", "Team A vs B?", 50000, "tok_sport", 0, "sports", "2024-01-01T00:00:00"),
+            )
+
+        with patch.object(collector, "_fetch_price_history", return_value=[]):
+            collector.collect_histories_only()  # no market_types → all types
+
+        with get_backtest_db(TEST_BACKTEST_DB) as conn:
+            pred = conn.execute("SELECT has_history FROM bt_markets WHERE id = 'pred1'").fetchone()
+            sport = conn.execute("SELECT has_history FROM bt_markets WHERE id = 'sport1'").fetchone()
+
+        # Both markets were processed (no filter applied)
+        assert pred["has_history"] == -1
+        assert sport["has_history"] == -1
+
+        collector.close()
+
 
 # ---------------------------------------------------------------------------
 # 8.3 Test load_markets() filtering
@@ -1200,6 +1272,8 @@ class TestEstimationErrorHandling:
             mock_estimate.confidence_low = 0.60
             mock_estimate.confidence_high = 0.80
             mock_estimate.thesis = "Test thesis"
+            mock_estimate.base_rate = 0.50
+            mock_estimate.updated_estimate = 0.65
             mock_estimator.estimate.side_effect = [Exception("LLM error"), mock_estimate]
             mock_est_cls.return_value = mock_estimator
 
@@ -1255,6 +1329,8 @@ class TestPerTrialCostDelta:
             mock_estimate.confidence_low = 0.60
             mock_estimate.confidence_high = 0.80
             mock_estimate.thesis = "Test"
+            mock_estimate.base_rate = 0.50
+            mock_estimate.updated_estimate = 0.65
             mock_estimator.estimate.return_value = mock_estimate
             mock_est_cls.return_value = mock_estimator
 
@@ -2069,6 +2145,8 @@ def _mock_estimator_and_llm():
     mock_estimate.confidence_low = 0.60
     mock_estimate.confidence_high = 0.80
     mock_estimate.thesis = "Test thesis"
+    mock_estimate.base_rate = 0.50
+    mock_estimate.updated_estimate = 0.65
     mock_estimator = MagicMock()
     mock_estimator.estimate.return_value = mock_estimate
     mock_llm = MagicMock()

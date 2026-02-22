@@ -179,3 +179,37 @@ option. When omitted, the default `['prediction']` is passed to
 #### Scenario: evaluate default uses prediction only
 - **WHEN** `polymarket backtest evaluate` is invoked without `--market-type`
 - **THEN** `select_markets_stratified(market_types=['prediction'])` is called
+
+## ADDED Requirements (collect-type-filter)
+
+### Requirement: --market-type option on collect subcommand
+The `backtest collect` command MUST accept a repeatable `--market-type` option (Click `multiple=True`). When provided, the supplied types are passed as `market_types` to `collect_histories_only()`. When omitted, no filter is applied (all market types are collected), preserving existing behavior. The option MUST only affect the histories collection phase, not the market metadata collection phase.
+
+#### Scenario: --market-type filters histories collection
+- **WHEN** `polymarket backtest collect --histories-only --market-type prediction` is invoked
+- **THEN** `collect_histories_only(market_types=['prediction'])` is called, skipping sports, tick, and economic-range markets
+
+#### Scenario: --market-type repeatable for multiple types
+- **WHEN** `polymarket backtest collect --histories-only --market-type prediction --market-type economic-range` is invoked
+- **THEN** `collect_histories_only(market_types=['prediction', 'economic-range'])` is called
+
+#### Scenario: omitting --market-type collects all types
+- **WHEN** `polymarket backtest collect --histories-only` is invoked without `--market-type`
+- **THEN** `collect_histories_only(market_types=None)` is called, and all market types with `has_history=0` are eligible
+
+#### Scenario: --market-type is discoverable in help
+- **WHEN** `polymarket backtest collect --help` is invoked
+- **THEN** `--market-type` appears in the option list with a description such as "Restrict history collection to market type (repeatable)"
+
+## ADDED Requirements (blind-mode)
+
+### Requirement: --no-market-price flag on backtest simulate
+The `backtest simulate` command MUST accept a `--no-market-price` boolean flag (Click `is_flag=True`, default `False`). When set, `run_simulation()` is called with `include_market_price=False`, which withholds market price from the LLM in Pass 2 and uses the blind adversarial in Pass 2.5. The simulation setup output MUST display `BLIND MODE — market price hidden from LLM` when this flag is active.
+
+#### Scenario: Blind simulate run
+- **WHEN** `polymarket backtest simulate --no-market-price -n 20` is invoked
+- **THEN** `run_simulation(markets, include_market_price=False)` is called, the setup output includes the BLIND MODE notice, and the resulting run record has `config["include_market_price"] = false`
+
+#### Scenario: Default simulate is anchored (backward compatibility)
+- **WHEN** `polymarket backtest simulate -n 20` is invoked without `--no-market-price`
+- **THEN** `run_simulation(markets, include_market_price=True)` is called, behaviour is identical to before this change
