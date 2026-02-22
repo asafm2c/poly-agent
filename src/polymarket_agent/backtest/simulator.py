@@ -451,10 +451,12 @@ def _run_single_trial(
     reasoning = None
     base_rate_estimate = None
     pass2_estimate = None
+    pass2_blind_estimate = None
     trial_cost = 0.0
     try:
         estimate = estimator.estimate(
             market_obj, model=effective_model, include_market_price=include_market_price,
+            capture_blind_pass2=include_market_price,  # only useful in anchored mode
         )
         agent_estimate = estimate.final_estimate
         confidence_low = estimate.confidence_low
@@ -462,6 +464,7 @@ def _run_single_trial(
         reasoning = estimate.thesis
         base_rate_estimate = estimate.base_rate
         pass2_estimate = estimate.updated_estimate
+        pass2_blind_estimate = estimate.blind_pass2_estimate
         trial_cost = estimate.llm_cost if isinstance(getattr(estimate, "llm_cost", None), (int, float)) else 0.0
     except Exception as e:
         logger.error("Estimation failed for %s: %s", market_dict["id"][:16], e)
@@ -496,8 +499,8 @@ def _run_single_trial(
                  agent_estimate, confidence_low, confidence_high, outcome,
                  agent_brier, market_brier, edge, simulated_trade,
                  reasoning, llm_cost, duration_ms, model, training_recency_score,
-                 base_rate_estimate, pass2_estimate)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 base_rate_estimate, pass2_estimate, pass2_blind_estimate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, market_dict["id"], horizon, market_price,
                     agent_estimate, confidence_low, confidence_high, outcome,
@@ -505,7 +508,7 @@ def _run_single_trial(
                     json.dumps(trade) if trade else None,
                     reasoning, trial_cost, trial_duration,
                     effective_model, recency_score,
-                    base_rate_estimate, pass2_estimate,
+                    base_rate_estimate, pass2_estimate, pass2_blind_estimate,
                 ),
             )
 

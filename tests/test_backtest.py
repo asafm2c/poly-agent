@@ -1274,6 +1274,7 @@ class TestEstimationErrorHandling:
             mock_estimate.thesis = "Test thesis"
             mock_estimate.base_rate = 0.50
             mock_estimate.updated_estimate = 0.65
+            mock_estimate.blind_pass2_estimate = None
             mock_estimator.estimate.side_effect = [Exception("LLM error"), mock_estimate]
             mock_est_cls.return_value = mock_estimator
 
@@ -1331,6 +1332,7 @@ class TestPerTrialCostDelta:
             mock_estimate.thesis = "Test"
             mock_estimate.base_rate = 0.50
             mock_estimate.updated_estimate = 0.65
+            mock_estimate.blind_pass2_estimate = None
             mock_estimator.estimate.return_value = mock_estimate
             mock_est_cls.return_value = mock_estimator
 
@@ -2147,6 +2149,7 @@ def _mock_estimator_and_llm():
     mock_estimate.thesis = "Test thesis"
     mock_estimate.base_rate = 0.50
     mock_estimate.updated_estimate = 0.65
+    mock_estimate.blind_pass2_estimate = None
     mock_estimator = MagicMock()
     mock_estimator.estimate.return_value = mock_estimate
     mock_llm = MagicMock()

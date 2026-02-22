@@ -144,15 +144,17 @@ Evidence in hypothesis tracker: run #9 (brier_diff +0.0106) and run #10 (brier_d
 
 - ~~How much does Pass 1 diverge from market?~~ **Answered: 0.307 avg, Brier 0.2505.**
 - ~~Is blind mode better?~~ **Answered: No. 3.5× worse. Market price is informative.**
-- When does the LLM have information not yet in the market price? This is the core
-  question for edge. Candidates: markets with recent news not yet reflected, markets
-  with low liquidity/slow price discovery, markets where LLM has strong domain priors.
+- ~~When does the LLM have information not yet in the market price?~~ **See `when-llm-leads.md`
+  for full strategic breakdown and proposed experiments.**
 - Is the LLM-market correlation stronger or weaker on low-volume markets?
   (Low-volume = less price discovery = more room for LLM divergence to be correct)
+  → **Experiment B** in `when-llm-leads.md`
 - What happens to anchored vs. blind comparison on markets resolving 0.2-0.8?
   (Ambiguous markets — where the market's signal is weaker — may be where blind does better)
 - Can we identify in advance which markets are "high-consensus" (LLM should defer to
-  market) vs. "uncertain" (LLM may have an edge)? This is the screening problem.
+  market) vs. "uncertain" (LLM may have an edge)?
+  → **The `base_rate_estimate` divergence score** is the proposed operationalization.
+  See `when-llm-leads.md`.
 
 ## Relationship to Existing Thesis
 

@@ -90,8 +90,17 @@ class ProbabilityEstimator:
         self, market: Market, calibration_text: str | None = None,
         token_id: str | None = None, model: str | None = None,
         include_market_price: bool = True,
+        capture_blind_pass2: bool = False,
     ) -> ProbabilityEstimate:
-        """Run full four-pass estimation on a market (including adversarial)."""
+        """Run full four-pass estimation on a market (including adversarial).
+
+        Args:
+            capture_blind_pass2: If True, run Pass 2 a second time without the
+                market price anchor and store the result in
+                ``ProbabilityEstimate.blind_pass2_estimate``.  This adds one
+                extra LLM call but captures the "research-only" signal that is
+                independent of market consensus.
+        """
         # Gather research
         tid = token_id or market.outcome_yes_token
         dossier = self.research.gather(market, token_id=tid)
@@ -102,12 +111,26 @@ class ProbabilityEstimator:
         base_rate = base_rate_result.get("base_rate", 0.5)
         base_reasoning = base_rate_result.get("reasoning", "No reasoning provided")
 
-        # Pass 2: Bayesian update
+        # Pass 2: Bayesian update (anchored)
         update_result = self._pass2_update(
             market, base_rate, base_reasoning, dossier_text,
             model=model, include_market_price=include_market_price,
         )
         updated_estimate = update_result.get("updated_estimate", base_rate)
+
+        # Pass 2 (blind): same update without market price anchor
+        blind_pass2_estimate: float | None = None
+        if capture_blind_pass2 and include_market_price:
+            # Only meaningful when the main run is anchored; in full blind mode
+            # updated_estimate already is the blind estimate.
+            try:
+                blind_result = self._pass2_update(
+                    market, base_rate, base_reasoning, dossier_text,
+                    model=model, include_market_price=False,
+                )
+                blind_pass2_estimate = blind_result.get("updated_estimate", base_rate)
+            except Exception as e:
+                logger.warning("Blind Pass 2 capture failed for %s: %s", market.id, e)
         key_evidence = update_result.get("key_evidence", [])
         thesis = update_result.get("thesis", "")
         conf_low = update_result.get("confidence_low", max(0, updated_estimate - 0.15))
@@ -152,6 +175,7 @@ class ProbabilityEstimator:
             key_evidence=key_evidence,
             thesis=thesis,
             timestamp=datetime.utcnow(),
+            blind_pass2_estimate=blind_pass2_estimate,
         )
 
     def _pass1_base_rate(self, market: Market, model: str | None = None) -> dict:

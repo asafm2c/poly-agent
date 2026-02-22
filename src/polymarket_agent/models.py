@@ -157,6 +157,7 @@ class ProbabilityEstimate(BaseModel):
     screening_passed: bool = True
     screening_reasoning: str | None = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+    blind_pass2_estimate: float | None = None
 
 
 # --- Edge & Trade Recommendation ---
