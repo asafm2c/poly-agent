@@ -2603,3 +2603,225 @@ class TestClassifyMarketType:
     def test_tick_beats_sports_priority(self):
         from polymarket_agent.backtest.classifier import classify_market_type
         assert classify_market_type("BTC Up or Down vs ETH", "Match Winner") == "tick"
+
+
+# ---------------------------------------------------------------------------
+# Domain type classifier (LLM-based)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDomainType:
+    def test_actuarial_returned(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.return_value = {"domain_type": "actuarial"}
+        result = classify_domain_type("Will there be a 7.0+ earthquake in 2025?", mock_llm)
+        assert result == "actuarial"
+
+    def test_current_event_returned(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.return_value = {"domain_type": "current_event"}
+        result = classify_domain_type("Will TikTok be banned in the US?", mock_llm)
+        assert result == "current_event"
+
+    def test_mixed_returned(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.return_value = {"domain_type": "mixed"}
+        result = classify_domain_type("Will Biden win re-election?", mock_llm)
+        assert result == "mixed"
+
+    def test_fallback_on_missing_key(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.return_value = {}
+        result = classify_domain_type("Something?", mock_llm)
+        assert result == "mixed"
+
+    def test_fallback_on_invalid_value(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.return_value = {"domain_type": "unknown_type"}
+        result = classify_domain_type("Something?", mock_llm)
+        assert result == "mixed"
+
+    def test_fallback_on_llm_error(self):
+        from polymarket_agent.backtest.classifier import classify_domain_type
+
+        mock_llm = MagicMock()
+        mock_llm.complete_json.side_effect = Exception("API error")
+        result = classify_domain_type("Something?", mock_llm)
+        assert result == "mixed"
+
+
+# ---------------------------------------------------------------------------
+# domain_type and price_min/price_max filters in select_markets
+# ---------------------------------------------------------------------------
+
+
+def _seed_domain_markets(db_path):
+    """Seed markets with domain_type and varied horizon prices for filter tests."""
+    from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+
+    init_backtest_db(db_path)
+
+    now = datetime.now(timezone.utc).isoformat()
+    end_date = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    end_ts = int((datetime.now(timezone.utc) - timedelta(days=5)).timestamp())
+
+    with get_backtest_db(db_path) as conn:
+        # Market A: actuarial, price at horizon ~0.40 (uncertain)
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, category, end_date, volume, liquidity,
+                resolution_outcome, yes_token, no_token, has_history, collected_at,
+                market_type, domain_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+            ("dm-a", "Earthquake 7.0+ by July?", None, end_date,
+             200000, 5000, "YES", "ta1", "ta2", now, "prediction", "actuarial"),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("dm-a", ts, 0.40),
+            )
+
+        # Market B: current_event, price at horizon ~0.85 (decided)
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, category, end_date, volume, liquidity,
+                resolution_outcome, yes_token, no_token, has_history, collected_at,
+                market_type, domain_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+            ("dm-b", "Will TikTok be banned?", None, end_date,
+             300000, 10000, "YES", "tb1", "tb2", now, "prediction", "current_event"),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("dm-b", ts, 0.85),
+            )
+
+        # Market C: actuarial, price at horizon ~0.90 (decided)
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, category, end_date, volume, liquidity,
+                resolution_outcome, yes_token, no_token, has_history, collected_at,
+                market_type, domain_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+            ("dm-c", "Will there be a recession in 2025?", None, end_date,
+             150000, 3000, "NO", "tc1", "tc2", now, "prediction", "actuarial"),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("dm-c", ts, 0.90),
+            )
+
+        # Market D: domain_type NULL (unclassified)
+        conn.execute(
+            """INSERT INTO bt_markets (id, question, category, end_date, volume, liquidity,
+                resolution_outcome, yes_token, no_token, has_history, collected_at,
+                market_type, domain_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+            ("dm-d", "Unclassified market?", None, end_date,
+             250000, 8000, "YES", "td1", "td2", now, "prediction", None),
+        )
+        for d in range(30, 0, -1):
+            ts = end_ts - d * 86400
+            conn.execute(
+                "INSERT INTO bt_price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                ("dm-d", ts, 0.50),
+            )
+
+
+class TestSelectMarketsFilters:
+    """Tests for domain_types and price_min/price_max filters in select_markets."""
+
+    def test_domain_type_filter_actuarial(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        markets = select_markets(
+            count=10, volume_min=0, domain_types=["actuarial"], db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-a" in ids
+        assert "dm-c" in ids
+        assert "dm-b" not in ids  # current_event
+        assert "dm-d" not in ids  # NULL domain_type excluded
+
+    def test_domain_type_filter_current_event(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        markets = select_markets(
+            count=10, volume_min=0, domain_types=["current_event"], db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-b" in ids
+        assert "dm-a" not in ids
+        assert "dm-c" not in ids
+
+    def test_price_min_filter(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        # price_min=0.80 should exclude dm-a (0.40) and include dm-b (0.85), dm-c (0.90)
+        markets = select_markets(
+            count=10, volume_min=0, price_min=0.80, db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-a" not in ids
+        assert "dm-b" in ids
+        assert "dm-c" in ids
+
+    def test_price_max_filter(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        # price_max=0.60 should include only dm-a (0.40) and dm-d (0.50)
+        markets = select_markets(
+            count=10, volume_min=0, price_max=0.60, db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-a" in ids
+        assert "dm-d" in ids
+        assert "dm-b" not in ids
+        assert "dm-c" not in ids
+
+    def test_price_range_filter(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        # price range 0.30-0.60: only dm-a (0.40) and dm-d (0.50)
+        markets = select_markets(
+            count=10, volume_min=0, price_min=0.30, price_max=0.60, db_path=TEST_BACKTEST_DB
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-a" in ids
+        assert "dm-d" in ids
+        assert "dm-b" not in ids
+        assert "dm-c" not in ids
+
+    def test_domain_type_and_price_combined(self):
+        from polymarket_agent.backtest.simulator import select_markets
+
+        _seed_domain_markets(TEST_BACKTEST_DB)
+        # actuarial + uncertain price (0.15-0.85): only dm-a (0.40), not dm-c (0.90)
+        markets = select_markets(
+            count=10, volume_min=0,
+            domain_types=["actuarial"],
+            price_min=0.15, price_max=0.85,
+            db_path=TEST_BACKTEST_DB,
+        )
+        ids = {m["id"] for m in markets}
+        assert "dm-a" in ids
+        assert "dm-c" not in ids
+        assert "dm-b" not in ids

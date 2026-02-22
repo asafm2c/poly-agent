@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS bt_markets (
     has_history INTEGER DEFAULT 0,
     collected_at TEXT NOT NULL,
     event_id TEXT,
-    market_type TEXT
+    market_type TEXT,
+    domain_type TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bt_price_history (
@@ -150,6 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_bt_markets_category ON bt_markets(category);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_end_date ON bt_markets(end_date);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_volume ON bt_markets(volume);
 CREATE INDEX IF NOT EXISTS idx_bt_markets_market_type ON bt_markets(market_type);
+CREATE INDEX IF NOT EXISTS idx_bt_markets_domain_type ON bt_markets(domain_type);
 CREATE INDEX IF NOT EXISTS idx_bt_price_history_market ON bt_price_history(market_id);
 CREATE INDEX IF NOT EXISTS idx_bt_sim_trials_run ON bt_simulation_trials(run_id);
 CREATE INDEX IF NOT EXISTS idx_bt_sim_trials_market ON bt_simulation_trials(market_id);
@@ -244,18 +246,23 @@ def _migrate_simulation_trials(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_markets(conn: sqlite3.Connection) -> None:
-    """Add market_type column to bt_markets if not present."""
+    """Add market_type and domain_type columns to bt_markets if not present."""
     tables = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     )}
     if "bt_markets" not in tables:
-        return  # Fresh DB — schema creation will include the column
+        return  # Fresh DB — schema creation will include the columns
 
     existing = {row[1] for row in conn.execute("PRAGMA table_info(bt_markets)")}
     if "market_type" not in existing:
         conn.execute("ALTER TABLE bt_markets ADD COLUMN market_type TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_bt_markets_market_type ON bt_markets(market_type)"
+    )
+    if "domain_type" not in existing:
+        conn.execute("ALTER TABLE bt_markets ADD COLUMN domain_type TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bt_markets_domain_type ON bt_markets(domain_type)"
     )
 
 

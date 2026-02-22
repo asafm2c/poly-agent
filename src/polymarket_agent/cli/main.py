@@ -595,6 +595,91 @@ def backtest_backfill(stats: bool):
     console.print(table)
 
 
+@backtest.command("classify-domains")
+@click.option("--limit", "-n", type=int, default=500,
+              help="Max prediction markets to classify (default: 500). Use 0 for all.")
+@click.option("--stats", is_flag=True, help="Show domain_type distribution without classifying.")
+@click.option("--concurrency", type=int, default=10, help="Parallel Haiku threads (default: 10).")
+@click.option("--reclassify", is_flag=True, help="Re-classify markets that already have a domain_type.")
+def classify_domains(limit: int, stats: bool, concurrency: int, reclassify: bool):
+    """Tag bt_markets prediction questions with domain_type (actuarial / current_event / mixed).
+
+    Uses Haiku LLM. Only processes prediction market_type rows by default.
+    Cost: ~$0.001 per 100 markets.
+    """
+    import concurrent.futures
+
+    from polymarket_agent.analyst.llm_client import LLMClient
+    from polymarket_agent.backtest.classifier import classify_domain_type
+    from polymarket_agent.backtest.database import get_backtest_db, init_backtest_db
+    from polymarket_agent.config import settings
+    from rich.table import Table as RichTable
+
+    init_backtest_db()
+
+    if stats:
+        with get_backtest_db(settings.backtest_db_path) as conn:
+            rows = conn.execute(
+                """SELECT COALESCE(domain_type, '(null)') as dtype, COUNT(*) as cnt
+                FROM bt_markets WHERE market_type = 'prediction'
+                GROUP BY dtype ORDER BY cnt DESC"""
+            ).fetchall()
+        table = RichTable(title="Domain Type Distribution — prediction markets")
+        table.add_column("domain_type")
+        table.add_column("count", justify="right")
+        for r in rows:
+            table.add_row(r["dtype"], f"{r['cnt']:,}")
+        console.print(table)
+        return
+
+    with get_backtest_db(settings.backtest_db_path) as conn:
+        query = "SELECT id, question FROM bt_markets WHERE market_type = 'prediction'"
+        if not reclassify:
+            query += " AND domain_type IS NULL"
+        rows = conn.execute(query).fetchall()
+
+    if not rows:
+        console.print("[green]All eligible markets already classified.[/]")
+        return
+
+    target = rows if limit == 0 else rows[:limit]
+    estimated_cost = len(target) * 0.00001  # ~$0.001 per 100 at Haiku rates
+    console.print(
+        f"Classifying [bold]{len(target):,}[/] markets "
+        f"(of {len(rows):,} unclassified, est. cost ${estimated_cost:.3f})..."
+    )
+
+    llm = LLMClient()
+
+    def _classify(row: dict) -> tuple[str, str]:
+        return row["id"], classify_domain_type(row["question"], llm)
+
+    results: list[tuple[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_classify, r): r for r in target}
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
+            done += 1
+            if done % 50 == 0:
+                console.print(f"  {done}/{len(target)}...")
+
+    with get_backtest_db(settings.backtest_db_path) as conn:
+        conn.executemany(
+            "UPDATE bt_markets SET domain_type = ? WHERE id = ?",
+            [(dtype, mid) for mid, dtype in results],
+        )
+
+    from collections import Counter
+    dist = Counter(dtype for _, dtype in results)
+    table = RichTable(title=f"classify-domains complete — {len(results):,} markets tagged")
+    table.add_column("domain_type")
+    table.add_column("count", justify="right")
+    for dtype, cnt in dist.most_common():
+        table.add_row(dtype, f"{cnt:,}")
+    console.print(table)
+
+
 @backtest.command("analyze")
 @click.option("--category", "-c", help="Filter by category")
 @click.option("--regime", "-r", help="Filter by regime (e.g. o1-era, GPT4o-era)")
@@ -738,6 +823,12 @@ def show_strategy():
               help="Restrict to market type (repeatable). Default: prediction.")
 @click.option("--no-market-price", "blind", is_flag=True, default=False,
               help="Hide market price from LLM — measures independent signal only.")
+@click.option("--domain-type", "domain_types", multiple=True,
+              help="Filter by domain_type (repeatable): actuarial, current_event, mixed.")
+@click.option("--price-min", type=float, default=None,
+              help="Min market price at horizon (e.g. 0.15 to target uncertain markets).")
+@click.option("--price-max", type=float, default=None,
+              help="Max market price at horizon (e.g. 0.85 to target uncertain markets).")
 def simulate_backtest(
     horizon: int,
     count: int,
@@ -749,11 +840,15 @@ def simulate_backtest(
     concurrency: int | None,
     market_types: tuple[str, ...],
     blind: bool,
+    domain_types: tuple[str, ...],
+    price_min: float | None,
+    price_max: float | None,
 ):
     """Run LLM estimation against historical markets to measure accuracy."""
     from polymarket_agent.backtest.simulator import run_simulation, select_markets
 
     resolved_types = list(market_types) if market_types else ["prediction"]
+    resolved_domains = list(domain_types) if domain_types else None
 
     console.print(f"\n[bold]Simulation Setup[/]")
     console.print(f"  Horizon: {horizon} days before resolution")
@@ -765,6 +860,12 @@ def simulate_backtest(
         console.print(f"  Max volume: <= ${max_volume:,.0f}")
     if regime:
         console.print(f"  Regime: {regime}")
+    if resolved_domains:
+        console.print(f"  Domain types: {', '.join(resolved_domains)}")
+    if price_min is not None or price_max is not None:
+        lo = price_min if price_min is not None else 0.0
+        hi = price_max if price_max is not None else 1.0
+        console.print(f"  Price at horizon: [{lo:.2f}, {hi:.2f}]")
     if blind:
         console.print(f"  [yellow]BLIND MODE — market price hidden from LLM[/]")
     if dry_run:
@@ -780,6 +881,9 @@ def simulate_backtest(
             regime=regime,
             horizon=horizon,
             market_types=resolved_types,
+            domain_types=resolved_domains,
+            price_min=price_min,
+            price_max=price_max,
         )
 
     if not markets:

@@ -187,6 +187,9 @@ def select_markets(
     horizon: int = DEFAULT_HORIZON,
     db_path: Path | None = None,
     market_types: list[str] | None = None,
+    domain_types: list[str] | None = None,
+    price_min: float | None = None,
+    price_max: float | None = None,
 ) -> list[dict]:
     """Select historical markets for simulation.
 
@@ -195,6 +198,10 @@ def select_markets(
 
     Args:
         market_types: If not None, restrict to markets whose market_type is in this list.
+        domain_types: If not None, restrict to markets whose domain_type is in this list
+            (e.g. ['actuarial']). Markets with NULL domain_type are excluded.
+        price_min: If set, only include markets whose price at horizon is >= this value.
+        price_max: If set, only include markets whose price at horizon is <= this value.
     """
     conditions = [
         "m.has_history = 1",
@@ -238,6 +245,25 @@ def select_markets(
         placeholders = ",".join("?" * len(market_types))
         conditions.append(f"m.market_type IN ({placeholders})")
         params.extend(market_types)
+
+    if domain_types is not None:
+        placeholders = ",".join("?" * len(domain_types))
+        conditions.append(f"m.domain_type IN ({placeholders})")
+        params.extend(domain_types)
+
+    if price_min is not None or price_max is not None:
+        lo = price_min if price_min is not None else 0.0
+        hi = price_max if price_max is not None else 1.0
+        conditions.append(
+            """(
+                SELECT p.price FROM bt_price_history p
+                WHERE p.market_id = m.id
+                AND p.timestamp <= CAST(strftime('%%s', m.end_date, '-%d days') AS INTEGER)
+                ORDER BY p.timestamp DESC
+                LIMIT 1
+            ) BETWEEN ? AND ?""" % horizon
+        )
+        params.extend([lo, hi])
 
     where = " AND ".join(conditions)
     path = db_path or settings.backtest_db_path
