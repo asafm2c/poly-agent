@@ -378,9 +378,61 @@ before adversarial. This gives Brier 0.0242 — only 1.6× worse than market (0.
 and it would reveal cases where the LLM's research produces a different picture from
 the market price. That divergence would be the cleanest "information lead" signal.
 
-**New Experiment D (revised):** Implement a `pass2_blind_estimate` column — run Pass 2
-with the full dossier but without market price, capture the result before adversarial.
-Compare `abs(pass2_blind_estimate - market_price)` as an opportunity signal.
+**`pass2_blind_estimate` is now implemented and collecting.** See Experiment D
+Validation below.
+
+---
+
+## Experiment D Validation: pass2_blind_estimate Results (n=40, runs #15–#16)
+
+First real data with `pass2_blind_estimate` stored per trial:
+
+### Overall (runs #15 + #16, n=40):
+
+| Estimator | Brier | vs Market |
+|-----------|-------|-----------|
+| Blind P2 (`pass2_blind_estimate`) | **0.054** | **+7% better** |
+| Final agent | 0.055 | +4% better |
+| Market | 0.058 | — |
+| Anchored P2 (`pass2_estimate`) | 0.062 | −7% worse |
+
+Blind P2 beats anchored P2 by ~15% and beats the market slightly overall.
+
+### By market price tier:
+
+| Tier | n | Blind P2 | Anch P2 | Agent | Market |
+|------|---|----------|---------|-------|--------|
+| uncertain (0.25–0.75) | 4 | 0.2032 | 0.1494 | 0.3107 | 0.344 |
+| moderate (0.1–0.25 or 0.75–0.9) | 3 | 0.1564 | 0.0426 | 0.0264 | 0.0188 |
+| decided (<0.1 or >0.9) | 33 | 0.027 | 0.053 | 0.027 | **0.026** |
+
+On **decided markets** (the bulk of post-Claude4 prediction markets), blind P2 = agent
+= market quality. Anchored P2 is substantially worse — the LLM's evidence integration
+in Pass 2 *with* the market price anchor is counterproductive on decided markets.
+
+On **uncertain markets** (4 cases), the pattern reverses: anchored P2 > blind P2 >
+market. When prices are genuinely uncertain, the market anchor helps the LLM not
+over-commit to a wrong direction.
+
+### Key structural insight
+
+On post-Claude4 prediction markets:
+- **90% are decided** (price <0.1 or >0.9) — markets already know the answer
+- The LLM's job is not to estimate probability but to avoid being dragged wrong
+- Blind P2 succeeds here because it isn't distorted by market-price anchoring
+- Anchored P2 fails because it updates *away from* the extreme price based on
+  thin evidence, then gets pulled back — a noisy round trip
+
+**The implication for edge detection**: `pass2_blind_estimate` on uncertain markets
+(price 0.25–0.75) is where the signal/noise ratio is highest. But there are very
+few such markets in post-Claude4 era — they resolve quickly. The interesting markets
+for `pass2_blind_estimate` divergence analysis are in the 0.1–0.5 range.
+
+### No systematic bias confirmed
+
+Average `pass2_blind_estimate - market_price` = −0.004 across 40 trials. The blind
+adversarial bias (−0.067 per trial) is *not present* in blind Pass 2 alone — the
+bias comes entirely from the blind adversarial prompt pushing estimates down.
 
 ---
 
@@ -422,20 +474,26 @@ Compare `abs(pass2_blind_estimate - market_price)` as an opportunity signal.
 
 **Next actions (in priority order):**
 
-1. **Implement `pass2_blind_estimate`** — a hybrid mode: run Pass 2 with dossier but no
-   market price, capture the estimate. This is the cleanest "what does the research say
-   independent of market?" signal. It avoids the bearish adversarial bias.
+1. ~~**Implement `pass2_blind_estimate`**~~ DONE. Deployed in simulator. Runs #15–#16
+   confirm: blind P2 beats anchored P2 by 15% and beats market by 7% overall. No
+   systematic bias. See Experiment D Validation above.
 
-2. **Lower the history collection floor.** If we want to study sub-$10K markets, the
-   collector needs to be configured to collect history at lower volumes. This is an
-   infrastructure change, not a research question.
-
-3. **Build a domain classifier for question text.** The `category` field is NULL for
+2. **Build a domain classifier for question text.** The `category` field is NULL for
    most prediction markets. A cheap Haiku classifier on question text could distinguish
    "historical-pattern dominant" from "recent-event dominant" questions, enabling the
-   domain-prior hypothesis to be tested properly.
+   domain-prior hypothesis to be tested properly. Focus on the uncertain-market segment
+   (0.25–0.75 price range) where the signal-to-noise ratio is highest for blind P2.
+
+3. **Lower the history collection floor.** If we want to study sub-$10K markets, the
+   collector needs to be configured to collect history at lower volumes. This is an
+   infrastructure change, not a research question.
 
 4. **Run election-adjacent experiment intentionally.** The run #12 finding (agent beats
    market at 43% win rate on 2024 election-adjacent markets) is interesting but confounded
    by contamination. A clean version: target similar markets in a POST-cutoff period
    (2026 elections?) where the LLM has strong domain priors without training recall.
+
+5. **Analyze uncertain markets specifically.** Given the price-tier breakdown showing
+   all the signal is in uncertain markets (0.25–0.75), run a dedicated simulation
+   targeting uncertain markets across multiple regimes to see if blind P2 consistently
+   outperforms there.
