@@ -67,7 +67,9 @@ CREATE TABLE IF NOT EXISTS bt_simulation_trials (
     llm_cost REAL DEFAULT 0,
     duration_ms INTEGER DEFAULT 0,
     model TEXT,
-    training_recency_score REAL
+    training_recency_score REAL,
+    base_rate_estimate REAL,
+    pass2_estimate REAL
 );
 
 CREATE TABLE IF NOT EXISTS bt_hypotheses (
@@ -232,6 +234,10 @@ def _migrate_simulation_trials(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE bt_simulation_trials ADD COLUMN training_recency_score REAL"
         )
+    if "base_rate_estimate" not in existing:
+        conn.execute("ALTER TABLE bt_simulation_trials ADD COLUMN base_rate_estimate REAL")
+    if "pass2_estimate" not in existing:
+        conn.execute("ALTER TABLE bt_simulation_trials ADD COLUMN pass2_estimate REAL")
 
 
 def _migrate_markets(conn: sqlite3.Connection) -> None:

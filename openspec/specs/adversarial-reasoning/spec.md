@@ -42,3 +42,34 @@ The research dossier SHALL include a market microstructure section with order bo
 #### Scenario: Dossier omits order book section when unavailable
 - **WHEN** order book data could not be fetched
 - **THEN** the dossier is formatted without a market microstructure section (graceful degradation)
+
+## ADDED Requirements
+
+### Requirement: Blind adversarial mode omits market price
+`ProbabilityEstimator._pass25_adversarial()` MUST accept an `include_market_price: bool = True` parameter. When `include_market_price=False`, the pass MUST use `BLIND_ADVERSARIAL_PROMPT` and `BLIND_ADVERSARIAL_SYSTEM` instead of the standard market-anchored prompts. The blind variant challenges the estimate on its own reasoning merits — systematic biases, overlooked evidence, base rate neglect — without any reference to market price or discrepancy.
+
+#### Scenario: Blind adversarial challenges estimate without market reference
+- **GIVEN** `_pass25_adversarial()` is called with `include_market_price=False`
+- **WHEN** the LLM prompt is constructed
+- **THEN** the prompt contains no market price, no discrepancy, and no order book signals; it asks the LLM to evaluate whether the estimate's assumptions might be wrong
+
+#### Scenario: Standard adversarial unchanged when include_market_price=True
+- **GIVEN** `_pass25_adversarial()` is called with `include_market_price=True` (the default)
+- **WHEN** the LLM prompt is constructed
+- **THEN** behavior is identical to before: market price, discrepancy, order book, and related markets are included in the prompt
+
+### Requirement: Pass 2 market price section is conditional
+`ProbabilityEstimator._pass2_update()` MUST accept an `include_market_price: bool = True` parameter. When `True`, the update prompt includes `**Current market price (YES):** {price}` as a labelled field. When `False`, that line is omitted entirely from the prompt (not replaced with a placeholder).
+
+#### Scenario: Market price omitted in blind mode
+- **GIVEN** `_pass2_update()` is called with `include_market_price=False`
+- **WHEN** the LLM prompt is constructed
+- **THEN** no market price value appears anywhere in the prompt text
+
+#### Scenario: Market price included in standard mode
+- **GIVEN** `_pass2_update()` is called with `include_market_price=True` and `market.last_price_yes=0.62`
+- **WHEN** the LLM prompt is constructed
+- **THEN** the prompt contains `**Current market price (YES):** 0.62`
+
+### Requirement: include_market_price forwarded through estimate()
+`ProbabilityEstimator.estimate()` MUST accept `include_market_price: bool = True` and forward it to both `_pass2_update()` and `_pass25_adversarial()`. Pass 1 (base rate) and Pass 3 (calibration) are unaffected — they never receive market price regardless of this flag.

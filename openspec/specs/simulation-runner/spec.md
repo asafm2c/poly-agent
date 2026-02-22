@@ -119,3 +119,39 @@ testability with no filter).
 #### Scenario: Backward compatibility — existing callers
 - **WHEN** existing code calls `select_markets()` without the `market_types` parameter
 - **THEN** behavior is identical to passing `market_types=None` (no filter applied)
+
+## ADDED Requirements (blind-mode)
+
+### Requirement: include_market_price parameter on run_simulation()
+`run_simulation()` MUST accept `include_market_price: bool = True`. When provided, it MUST be forwarded to `ProbabilityEstimator.estimate(include_market_price=...)`. When `False`, the estimator runs without market price context in Pass 2 and uses the blind adversarial in Pass 2.5. Default `True` preserves all existing behaviour.
+
+#### Scenario: Blind simulation run
+- **GIVEN** `run_simulation(markets, include_market_price=False)` is called
+- **WHEN** each trial executes
+- **THEN** `estimate(market, include_market_price=False)` is called, the LLM never sees the market price in Pass 2 or Pass 2.5, and `config["include_market_price"] = False` is stored in the run record
+
+#### Scenario: Default is anchored mode (backward compatibility)
+- **GIVEN** `run_simulation()` is called without `include_market_price`
+- **WHEN** the simulation runs
+- **THEN** behaviour is identical to before: market price flows through Pass 2 and the standard adversarial pass
+
+### Requirement: include_market_price stored in run config
+The `include_market_price` value MUST be stored in the `config` JSON column of `bt_simulation_runs`, allowing post-hoc identification of which runs used blind mode.
+
+#### Scenario: Config records blind flag
+- **GIVEN** `run_simulation(markets, include_market_price=False)` is called
+- **WHEN** the run record is created
+- **THEN** the `config` JSON includes `"include_market_price": false`
+
+### Requirement: base_rate_estimate and pass2_estimate columns captured per trial
+`bt_simulation_trials` MUST have two additional REAL columns: `base_rate_estimate` (the Pass 1 output before any market price is shown) and `pass2_estimate` (the Bayesian-updated estimate after Pass 2). Both MUST be populated from `ProbabilityEstimate.base_rate` and `ProbabilityEstimate.updated_estimate` respectively and persisted alongside `agent_estimate` (the final output). A migration MUST add these columns to existing databases if absent.
+
+#### Scenario: Intermediate estimates persisted
+- **GIVEN** a trial completes successfully
+- **WHEN** the trial row is written
+- **THEN** `base_rate_estimate` contains the Pass 1 value, `pass2_estimate` contains the Pass 2 value, and `agent_estimate` contains the final (post-adversarial, post-calibration) value
+
+#### Scenario: Intermediate estimates NULL on estimation failure
+- **GIVEN** the estimator raises an exception during a trial
+- **WHEN** the trial row is written
+- **THEN** `base_rate_estimate`, `pass2_estimate`, and `agent_estimate` are all NULL

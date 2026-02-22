@@ -10,8 +10,7 @@ UPDATE_PROMPT = """Update the base rate probability using the following evidence
 
 **Question:** {question}
 **Category:** {category}
-**Current market price (YES):** {market_price}
-**Base rate from Pass 1:** {base_rate}
+{market_price_section}**Base rate from Pass 1:** {base_rate}
 **Base rate reasoning:** {base_rate_reasoning}
 
 ---

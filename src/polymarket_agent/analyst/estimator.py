@@ -7,6 +7,8 @@ from polymarket_agent.analyst.llm_client import LLMClient
 from polymarket_agent.analyst.prompts.adversarial import (
     ADVERSARIAL_PROMPT,
     ADVERSARIAL_SYSTEM,
+    BLIND_ADVERSARIAL_PROMPT,
+    BLIND_ADVERSARIAL_SYSTEM,
 )
 from polymarket_agent.analyst.prompts.base_rate import BASE_RATE_PROMPT, BASE_RATE_SYSTEM
 from polymarket_agent.analyst.prompts.calibration import (
@@ -87,6 +89,7 @@ class ProbabilityEstimator:
     def estimate(
         self, market: Market, calibration_text: str | None = None,
         token_id: str | None = None, model: str | None = None,
+        include_market_price: bool = True,
     ) -> ProbabilityEstimate:
         """Run full four-pass estimation on a market (including adversarial)."""
         # Gather research
@@ -100,7 +103,10 @@ class ProbabilityEstimator:
         base_reasoning = base_rate_result.get("reasoning", "No reasoning provided")
 
         # Pass 2: Bayesian update
-        update_result = self._pass2_update(market, base_rate, base_reasoning, dossier_text, model=model)
+        update_result = self._pass2_update(
+            market, base_rate, base_reasoning, dossier_text,
+            model=model, include_market_price=include_market_price,
+        )
         updated_estimate = update_result.get("updated_estimate", base_rate)
         key_evidence = update_result.get("key_evidence", [])
         thesis = update_result.get("thesis", "")
@@ -111,7 +117,7 @@ class ProbabilityEstimator:
         adv_result = self._pass25_adversarial(
             market, updated_estimate, conf_low, conf_high,
             dossier.order_book_signals, dossier.related_markets,
-            model=model,
+            model=model, include_market_price=include_market_price,
         )
         adversarial_estimate = adv_result.get("revised_estimate", updated_estimate)
         adv_conf_low = adv_result.get("confidence_low", conf_low)
@@ -164,12 +170,16 @@ class ProbabilityEstimator:
 
     def _pass2_update(
         self, market: Market, base_rate: float, base_reasoning: str, dossier_text: str,
-        model: str | None = None,
+        model: str | None = None, include_market_price: bool = True,
     ) -> dict:
+        if include_market_price and market.last_price_yes is not None:
+            market_price_section = f"**Current market price (YES):** {market.last_price_yes:.2f}\n"
+        else:
+            market_price_section = ""
         prompt = UPDATE_PROMPT.format(
             question=market.question,
             category=market.category or "Unknown",
-            market_price=f"{market.last_price_yes:.2f}" if market.last_price_yes else "N/A",
+            market_price_section=market_price_section,
             base_rate=f"{base_rate:.2f}",
             base_rate_reasoning=base_reasoning,
             dossier_text=dossier_text,
@@ -195,8 +205,37 @@ class ProbabilityEstimator:
         order_book_signals: OrderBookSignals | None = None,
         related_markets: list[dict] | None = None,
         model: str | None = None,
+        include_market_price: bool = True,
     ) -> dict:
-        """Adversarial pass: challenge the estimate by considering why the market might be right."""
+        """Adversarial pass: challenge the estimate.
+
+        When include_market_price=True, frames the challenge around market consensus
+        (why might the market be right?). When False, uses a blind adversarial that
+        challenges the estimate on its own merits without market reference.
+        """
+        if not include_market_price:
+            prompt = BLIND_ADVERSARIAL_PROMPT.format(
+                question=market.question,
+                category=market.category or "Unknown",
+                estimate=f"{estimate:.2f}",
+                confidence_low=f"{conf_low:.2f}",
+                confidence_high=f"{conf_high:.2f}",
+            )
+            try:
+                return self.llm.complete_json(
+                    prompt=prompt, system=BLIND_ADVERSARIAL_SYSTEM,
+                    max_tokens=768, temperature=0.3, model=model,
+                )
+            except Exception as e:
+                logger.error("Pass 2.5 (blind adversarial) failed for %s: %s", market.id, e)
+                return {
+                    "revised_estimate": estimate,
+                    "revision_applied": False,
+                    "falsification_argument": f"Blind adversarial pass failed: {e}",
+                    "confidence_low": conf_low,
+                    "confidence_high": conf_high,
+                }
+
         market_price = market.last_price_yes or 0.5
         discrepancy = estimate - market_price
 

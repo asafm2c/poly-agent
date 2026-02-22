@@ -11,6 +11,42 @@ If you find a compelling falsification argument, revise the estimate toward the 
 
 You must respond with valid JSON only."""
 
+BLIND_ADVERSARIAL_SYSTEM = """You are a skeptical forecaster. Your job is to challenge a probability estimate by looking for flaws in the reasoning, unconsidered evidence, and systematic biases — without reference to any market price.
+
+You should think about:
+- What assumptions in the base reasoning might be wrong?
+- What evidence might have been overlooked or underweighted?
+- What systematic biases (overconfidence, base rate neglect, narrative bias) might be distorting the estimate?
+- Is the estimate appropriately uncertain given what is and isn't known?
+
+If you find a compelling reason to revise, do so. If not, return the estimate unchanged.
+
+You must respond with valid JSON only."""
+
+BLIND_ADVERSARIAL_PROMPT = """Challenge the following probability estimate on its own merits.
+
+**Question:** {question}
+**Category:** {category}
+**Your current estimate (YES probability):** {estimate}
+**Confidence interval:** [{confidence_low}, {confidence_high}]
+
+---
+
+Instructions:
+1. Consider: What assumptions underlie this estimate, and which might be wrong?
+2. Look for unconsidered evidence, overlooked base rates, or framing effects.
+3. Consider whether the estimate is appropriately humble about what isn't known.
+4. If you find a compelling reason to revise, do so. If not, keep the estimate unchanged.
+
+Respond with JSON:
+{{
+    "revised_estimate": 0.XX,
+    "revision_applied": true/false,
+    "falsification_argument": "The strongest argument against your estimate",
+    "confidence_low": 0.XX,
+    "confidence_high": 0.XX
+}}"""
+
 ADVERSARIAL_PROMPT = """Challenge the following probability estimate.
 
 **Question:** {question}

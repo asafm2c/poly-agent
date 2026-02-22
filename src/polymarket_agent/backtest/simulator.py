@@ -425,6 +425,7 @@ def _run_single_trial(
     estimator,
     db_path: Path,
     db_lock: threading.Lock,
+    include_market_price: bool = True,
 ) -> dict:
     """Execute one simulation trial. Designed to run in a thread pool.
 
@@ -448,13 +449,19 @@ def _run_single_trial(
     confidence_low = None
     confidence_high = None
     reasoning = None
+    base_rate_estimate = None
+    pass2_estimate = None
     trial_cost = 0.0
     try:
-        estimate = estimator.estimate(market_obj, model=effective_model)
+        estimate = estimator.estimate(
+            market_obj, model=effective_model, include_market_price=include_market_price,
+        )
         agent_estimate = estimate.final_estimate
         confidence_low = estimate.confidence_low
         confidence_high = estimate.confidence_high
         reasoning = estimate.thesis
+        base_rate_estimate = estimate.base_rate
+        pass2_estimate = estimate.updated_estimate
         trial_cost = estimate.llm_cost if isinstance(getattr(estimate, "llm_cost", None), (int, float)) else 0.0
     except Exception as e:
         logger.error("Estimation failed for %s: %s", market_dict["id"][:16], e)
@@ -488,8 +495,9 @@ def _run_single_trial(
                 (run_id, market_id, horizon_days, market_price_at_horizon,
                  agent_estimate, confidence_low, confidence_high, outcome,
                  agent_brier, market_brier, edge, simulated_trade,
-                 reasoning, llm_cost, duration_ms, model, training_recency_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 reasoning, llm_cost, duration_ms, model, training_recency_score,
+                 base_rate_estimate, pass2_estimate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, market_dict["id"], horizon, market_price,
                     agent_estimate, confidence_low, confidence_high, outcome,
@@ -497,6 +505,7 @@ def _run_single_trial(
                     json.dumps(trade) if trade else None,
                     reasoning, trial_cost, trial_duration,
                     effective_model, recency_score,
+                    base_rate_estimate, pass2_estimate,
                 ),
             )
 
@@ -521,6 +530,7 @@ def run_simulation(
     model: str | None = None,
     hypothesis_id: int | None = None,
     concurrency: int | None = None,
+    include_market_price: bool = True,
 ) -> dict:
     """Run a simulation across selected markets.
 
@@ -544,6 +554,7 @@ def run_simulation(
     }
     effective_model = model or settings.analysis_model
     config["model"] = effective_model
+    config["include_market_price"] = include_market_price
     if hypothesis_id is not None:
         config["hypothesis_id"] = hypothesis_id
 
@@ -584,6 +595,7 @@ def run_simulation(
             db_lock=db_lock,
             max_concurrency=max_concurrency,
             total=len(markets),
+            include_market_price=include_market_price,
         )
     )
 
@@ -686,6 +698,7 @@ async def _run_trials_async(
     db_lock: threading.Lock,
     max_concurrency: int,
     total: int,
+    include_market_price: bool = True,
 ) -> list[dict]:
     """Run all trials concurrently bounded by a semaphore. Returns list of result dicts."""
     sem = asyncio.Semaphore(max_concurrency)
@@ -708,6 +721,7 @@ async def _run_trials_async(
                 estimator,
                 db_path,
                 db_lock,
+                include_market_price,
             )
         async with results_lock:
             completed += 1
