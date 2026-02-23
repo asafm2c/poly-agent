@@ -1,6 +1,84 @@
 # When Does the LLM Lead the Market?
 
-**Status:** Active research direction — operationalizing the edge detection problem
+**Status:** Research complete (Experiments A–G). No clean out-of-sample LLM edge
+confirmed. The seismic signal — initially the strongest candidate — is primarily a
+contamination artifact. The structural market-mispricing hypothesis remains untested
+on genuinely prospective data.
+
+---
+
+## Executive Summary
+
+Seven experiments run across 22 simulation runs (hundreds of trials). Key findings:
+
+### What the LLM is and isn't
+
+The LLM is an excellent **anchor-adjustor**: when given the current market price,
+it produces well-calibrated final estimates that are close to but slightly better
+than the market. Without the market price (blind mode), estimates are 3.5× worse.
+The LLM's unaided base rate (Pass 1) is near-random on general prediction markets.
+
+| Signal | Brier |
+|--------|-------|
+| LLM Pass 1 (base rate only) | 0.2505 — near random |
+| LLM anchored final estimate | 0.0261 |
+| LLM blind final estimate | 0.0905 — 3.5× worse |
+| Market price | 0.0155 |
+
+The LLM adds calibration on top of the market price; it does not replace it.
+
+### Where edge appeared — and why it wasn't real
+
+**Seismic frequency markets (Experiments E, F, G):**
+- Apparent edge: +0.014 Brier (agent 0.148 vs market 0.162 across 53 trials)
+- Root cause: **contamination**. All 25 seismic markets resolve in 2025, entirely
+  within the LLM's training window (cutoff ~August 2025)
+- Split test: edge +0.031 *within* cutoff, flips to −0.014 *post*-cutoff
+- A naive "always say 0.75" rule beats the LLM in the pre-cutoff window
+- The LLM's reasoning correctly cites Poisson base rates but implicit training bias
+  creates a directional pull toward the correct answer
+- **Verdict: not a forward-looking signal**
+
+**GDP / unemployment markets (Experiment F):**
+- Apparent edge: zero (perfect parity, 0.188/0.188)
+- LLM has training data containing specific quarterly results but does not recall
+  them — it reasons from base rates ("~15% recession probability"). Economic
+  statistics training knowledge does not surface as forecasting advantage.
+
+**Electoral, sports, crypto, news markets (all experiments):**
+- Market consistently wins or draws. Polymarket is ~80% current_event;
+  the LLM's base rates are outcompeted by market participants with current information.
+
+### What remains genuinely unknown
+
+1. **Structural seismic mispricing**: Do markets persistently underprice earthquake
+   probability due to recency/availability bias? This is the interesting hypothesis
+   but cannot be tested with in-sample data. Requires seismic markets resolving
+   2026+ collected and simulated before resolution.
+
+2. **Naive Poisson as a trading rule**: A "bet YES when seismic market < 0.65"
+   strategy might exploit real market mispricing — independent of LLM reasoning.
+   Needs prospective validation.
+
+3. **Information lag**: The anchored pipeline incorporating fresh web dossiers may
+   have edge in fast-moving news markets if the dossier contains post-market
+   information. Not yet isolated from the contamination confound.
+
+### Architecture implication
+
+The 4-pass pipeline is well-designed for what it does: producing calibrated
+estimates from a market price + research context. Its weakness is not the design —
+it's that there are very few market categories where the LLM has information the
+market doesn't. Training cutoff is the binding constraint.
+
+### Recommended next step
+
+Collect currently-open seismic markets on Polymarket resolving in late 2026,
+simulate them *today* (recording agent estimates), and wait for resolution.
+This is the only way to confirm or refute the structural mispricing hypothesis
+with a clean out-of-sample test.
+
+---
 
 ## The Setup
 
@@ -472,28 +550,21 @@ bias comes entirely from the blind adversarial prompt pushing estimates down.
    0.0242 (only 1.6× vs market's 0.0155), better than anchored Pass 2 (0.0355). The
    blind adversarial pass has a systematic bearish bias — avoid in blind mode.
 
-**Next actions (in priority order):**
+**Status as of 2026-02-22 (all items resolved):**
 
-1. ~~**Implement `pass2_blind_estimate`**~~ DONE. Deployed in simulator. Runs #15–#16
-   confirm: blind P2 beats anchored P2 by 15% and beats market by 7% overall. No
-   systematic bias. See Experiment D Validation above.
+1. ~~**Implement `pass2_blind_estimate`**~~ DONE.
+2. ~~**Build a domain classifier**~~ DONE. Haiku classifier + SQL keyword tagging deployed.
+   Tagged 907 actuarial markets; found only seismic has uncertain-zone coverage.
+3. **Lower the history collection floor.** Still open; no sub-$10K data available.
+4. ~~**Analyze uncertain markets**~~ DONE (Experiments E–G).
 
-2. **Build a domain classifier for question text.** The `category` field is NULL for
-   most prediction markets. A cheap Haiku classifier on question text could distinguish
-   "historical-pattern dominant" from "recent-event dominant" questions, enabling the
-   domain-prior hypothesis to be tested properly. Focus on the uncertain-market segment
-   (0.25–0.75 price range) where the signal-to-noise ratio is highest for blind P2.
+**Remaining open action:**
 
-3. **Lower the history collection floor.** If we want to study sub-$10K markets, the
-   collector needs to be configured to collect history at lower volumes. This is an
-   infrastructure change, not a research question.
-
-4. **Run election-adjacent experiment intentionally.** The run #12 finding (agent beats
-   market at 43% win rate on 2024 election-adjacent markets) is interesting but confounded
-   by contamination. A clean version: target similar markets in a POST-cutoff period
-   (2026 elections?) where the LLM has strong domain priors without training recall.
-
-5. ~~**Analyze uncertain markets specifically.**~~ Subsumed into Experiment E below.
+- **Prospective seismic validation**: Collect currently-open Polymarket seismic
+  questions resolving in late 2026 or 2027, run `backtest simulate` before resolution,
+  record agent estimates, wait for outcomes. This is the only clean test of whether
+  markets structurally underprice earthquake frequency. Cannot be done retroactively
+  with existing DB data — all 25 seismic markets resolve within training cutoff.
 
 ---
 
