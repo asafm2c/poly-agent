@@ -702,3 +702,93 @@ Explored and eliminated:
 **Conclusion: The actuarial alpha search on Polymarket is complete. Seismic is the sole
 reliable frequency-based signal. Pool size: ~25 tagged markets, ~24 eligible with 7d history,
 representing a small but real and mechanistically understood edge.**
+
+---
+
+## Experiment G: Seismic Signal Validity — Artifact or Real?
+
+**Date:** 2026-02-22
+**Goal:** Determine whether the seismic edge is genuine actuarial signal or an artifact
+via three distinct failure mode tests.
+
+### Failure Mode Tests
+
+**Test 1: Pre vs Post Training Cutoff Split (Contamination)**
+
+Split seismic trials by whether they resolve within or after Claude Sonnet 4.6's
+training cutoff (~August 2025). If edge is real, it should persist post-cutoff.
+If contaminated, it should disappear or flip.
+
+| Period | n (uncertain) | YES rate | LLM Brier | Mkt Brier | Edge |
+|--------|--------------|---------|-----------|-----------|------|
+| Within cutoff (May–Aug 2025) | 28 | 75% | 0.226 | 0.258 | **+0.031** |
+| Post-cutoff (Sep–Dec 2025) | 9 | 33% | 0.167 | 0.154 | **−0.014** |
+
+Month-by-month: edge is +0.034 in July 2025 → −0.001 in Sep → −0.047 in Nov → −0.058 in Dec.
+**The edge monotonically decays and reverses past the training cutoff.**
+
+**Test 2: Naive Poisson Baseline (YES-bias artifact)**
+
+Compare LLM against a dumb rule on pre-cutoff uncertain markets:
+
+| Model | Brier (pre-cutoff, n=28) | Brier (post-cutoff, n=9) |
+|-------|--------------------------|--------------------------|
+| LLM | 0.226 | 0.167 |
+| Market | 0.258 | **0.154** |
+| Always say 0.75 | **0.1875** | 0.396 |
+| Always say 0.85 | 0.1975 | 0.489 |
+
+In the pre-cutoff window (YES rate = 75%), a naive "always say 0.75" **beats the LLM** (0.1875 < 0.226).
+The LLM is not well-calibrated — it's just pricing above the market in a YES-dominant sample.
+In the post-cutoff window (YES rate = 33%), the market wins and naive Poisson fails catastrophically.
+
+**Test 3: Statistical Significance (inflated)**
+
+- Paired t-statistic = 2.616 (nominally p ≈ 0.01)
+- But n=53 trials are ~15 distinct markets × 3–5 repeat simulations
+- Effective n ≈ 12–15 → p-value is substantially overstated
+- Win rate: agent wins only 24/53 (45%) of individual trials; market wins 29/53
+- The apparent aggregate Brier advantage is magnitude-asymmetric on YES outcomes
+
+**Test 4: Reasoning Traces**
+
+LLM reasoning explicitly cites base rates ("~15-20 M7.0+ events/year, 90-95% monthly
+probability") — no explicit recall of specific earthquake dates. However, it cannot
+correctly interpret the market's end-of-window signal: on "Another 7.0+ in May?" where
+the market had collapsed to 0.195 (nearly over, no event), the LLM still priced 0.28.
+This is consistent with *implicit* contamination — training data creates directional bias
+without explicit memory of the event.
+
+### Verdict: Primarily Contamination Artifact
+
+All three failure modes are partially present:
+
+1. **Contamination (primary)**: Edge is strongly era-dependent, reverses post-cutoff.
+   All 25 seismic markets in the DB resolve in 2025, all within training window.
+   The LLM has implicit knowledge of 2025 seismicity from training data.
+
+2. **YES-bias (contributing)**: Pre-cutoff test period had 75% YES rate in uncertain zone
+   (far above ~60-65% Poisson expectation). Even a naive "always say 0.75" beats the LLM.
+   The sample was biased toward a YES-heavy window that also happened to be within training.
+
+3. **Statistical significance (inflated)**: Effective n ≈ 12–15 distinct markets after
+   de-duplicating repeat simulations. Apparent t=2.6 is not meaningful.
+
+### What Remains Unknown
+
+The **structural market mispricing hypothesis** — that markets persistently underprice
+earthquake frequency due to recency/availability bias — is **neither confirmed nor refuted**.
+We cannot test it because:
+- The DB has only 1 seismic market resolving before 2024 (insufficient)
+- All available markets resolve within LLM training window
+- A valid test requires pre-training-cutoff seismic markets or future collection
+
+To confirm/reject the structural signal cleanly: collect new Polymarket seismic questions
+resolving in late 2026 or 2027, simulate before they resolve, then compare to outcomes.
+
+### Practical Implication
+
+**Do not trade seismic markets based on these backtests.** The measured edge is not
+a forward-looking signal. If the structural mispricing is real, a simple rule (bet YES
+when market price < 0.65 on monthly seismic questions) might work — but this has not
+been validated on out-of-sample data. Collect and test on genuinely future markets first.
