@@ -1,4 +1,4 @@
-# Polymarket Agent
+# market-edge
 
 An autonomous prediction market trading agent powered by LLM probability estimation. The agent scans [Polymarket](https://polymarket.com) for mispriced markets, estimates probabilities using a multi-pass Claude pipeline, sizes positions with Kelly criterion, and executes trades or paper-trades against a local portfolio.
 
@@ -84,7 +84,7 @@ src/polymarket_dashboard/
 
 ```bash
 # Clone and install core dependencies
-git clone https://github.com/datori/trading.git
+git clone https://github.com/datori/market-edge.git
 cd trading
 uv sync
 

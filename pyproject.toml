@@ -1,7 +1,7 @@
 [project]
-name = "polymarket-agent"
+name = "market-edge"
 version = "0.1.0"
-description = "Autonomous Polymarket trading agent powered by LLM probability estimation"
+description = "LLM-powered prediction market trading agent and alpha research framework"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.81.0",
