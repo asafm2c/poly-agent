@@ -15,6 +15,8 @@ build/
 
 # SQLite databases
 *.db
+*.db-shm
+*.db-wal
 
 # IDE
 .idea/
@@ -25,9 +27,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
-
-# uv
-uv.lock
 
 # Data
 data/

@@ -11,6 +11,6 @@ done
 echo "[$(date)] >1M batch finished."
 
 echo "[$(date)] Starting 100K+ batch..."
-cd /home/openclaw/code/trading
+cd "$(dirname "$(realpath "$0")")/.."
 uv run polymarket backtest collect --histories-only --min-volume 100000
 echo "[$(date)] 100K+ batch complete."
